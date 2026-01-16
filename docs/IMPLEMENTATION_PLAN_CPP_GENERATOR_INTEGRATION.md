@@ -222,7 +222,7 @@ else:
 simp_fp = torch.from_numpy(self.fingerprint.compute(simplified)).float()
 ```
 
-**CRITICAL**: C++ generator computes fingerprint for `obfuscated_expr` only. Pre-computed fingerprints can ONLY be used when augmentation is disabled. When augmentation is enabled, fingerprints must be computed AFTER permutation to match the returned expression.
+**CRITICAL**: C++ generator computes fingerprint for `ground_truth_expr` (semantic signature). This provides stable semantic representation since ground truth and obfuscated are equivalent. Pre-computed fingerprints can ONLY be used when augmentation is disabled. When augmentation is enabled, fingerprints must be computed AFTER permutation to match the returned expression.
 
 ### 2.4 Fix ScaledMBADataset Fingerprint Protection
 
@@ -473,9 +473,10 @@ def main():
                 skipped += 1
                 continue
 
-            expr = item.get('obfuscated_expr') or item.get('obfuscated')
+            # C++ fingerprint computed from ground truth (semantic signature)
+            expr = item.get('ground_truth_expr') or item.get('simplified')
             if not expr:
-                print(f"Sample {i}: missing expression")
+                print(f"Sample {i}: missing ground truth expression")
                 skipped += 1
                 continue
 

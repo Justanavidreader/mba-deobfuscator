@@ -136,23 +136,28 @@ class BeamSearchDecoder:
             # Expand memory for batch [num_beams, 1, D_MODEL]
             memory_expanded = memory.expand(len(active_beams), -1, -1)
 
-            # Get logits from model
+            # Prepare source tokens tensor for copy mechanism
+            source_tokens_tensor = None
+            if src_tokens is not None:
+                source_tokens_tensor = torch.tensor(
+                    src_tokens, dtype=torch.long, device=self.device
+                ).unsqueeze(0).expand(len(active_beams), -1)
+
+            # Get logits from model (with copy mechanism if source_tokens provided)
             with torch.no_grad():
-                decode_output = self.model.decode(tgt_batch, memory_expanded)
-                vocab_logits = decode_output['vocab_logits']  # [num_beams, seq_len, vocab_size]
-                copy_attn = decode_output.get('copy_attn')  # [num_beams, seq_len, src_len]
-                p_gen = decode_output.get('p_gen')  # [num_beams, seq_len, 1]
+                decode_output = self.model.decode(
+                    tgt_batch, memory_expanded,
+                    source_tokens=source_tokens_tensor,
+                )
+
+                # Use final_logits if available (includes copy distribution)
+                if 'final_logits' in decode_output:
+                    vocab_logits = decode_output['final_logits']
+                else:
+                    vocab_logits = decode_output['vocab_logits']
 
             # Get logits for next token (last position)
             next_logits = vocab_logits[:, -1, :]  # [num_beams, vocab_size]
-
-            # Apply copy mechanism if available
-            if src_tokens is not None and copy_attn is not None and p_gen is not None:
-                copy_attn_last = copy_attn[:, -1, :]  # [num_beams, src_len]
-                p_gen_last = p_gen[:, -1, :]  # [num_beams, 1]
-                next_logits = self._apply_copy_mechanism(
-                    next_logits, copy_attn_last, p_gen_last, src_tokens
-                )
 
             # Apply temperature
             next_logits = next_logits / self.temperature

@@ -193,11 +193,17 @@ class Phase2Trainer(BaseTrainer):
 
         # Forward pass
         # Model expects target without last token for teacher forcing
-        outputs = self.model(graph_batch, fingerprint, target_ids[:, :-1])
+        outputs = self.model(
+            graph_batch, fingerprint, target_ids[:, :-1],
+            source_tokens=source_tokens,
+        )
+
+        # Use final_logits if available (includes copy distribution), else vocab_logits
+        logits = outputs.get('final_logits', outputs['vocab_logits'])
 
         # Compute losses
         loss_dict = phase2_loss(
-            vocab_logits=outputs['vocab_logits'],
+            vocab_logits=logits,
             copy_attn=outputs.get('copy_attn'),
             p_gen=outputs.get('p_gen'),
             length_pred=outputs['length_pred'],
@@ -243,7 +249,8 @@ class Phase2Trainer(BaseTrainer):
 
         Vectorized implementation using reduction='none' for efficiency.
         """
-        vocab_logits = outputs['vocab_logits']
+        # Use final_logits if available (includes copy distribution)
+        vocab_logits = outputs.get('final_logits', outputs['vocab_logits'])
 
         # Shift for autoregressive
         shift_logits = vocab_logits[:, :-1, :].contiguous()
@@ -337,11 +344,17 @@ class Phase2Trainer(BaseTrainer):
             depth = batch['depth'].to(self.device)
 
             # Forward pass
-            outputs = self.model(graph_batch, fingerprint, target_ids[:, :-1])
+            outputs = self.model(
+                graph_batch, fingerprint, target_ids[:, :-1],
+                source_tokens=source_tokens,
+            )
+
+            # Use final_logits if available (includes copy distribution)
+            logits = outputs.get('final_logits', outputs['vocab_logits'])
 
             # Compute loss
             loss_dict = phase2_loss(
-                vocab_logits=outputs['vocab_logits'],
+                vocab_logits=logits,
                 copy_attn=outputs.get('copy_attn'),
                 p_gen=outputs.get('p_gen'),
                 length_pred=outputs['length_pred'],

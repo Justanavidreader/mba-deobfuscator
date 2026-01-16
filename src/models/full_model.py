@@ -6,15 +6,19 @@ Supports both standard (~15M) and scaled (~360M) configurations:
 - Scaled: HGT/RGCN encoder, 8-layer decoder, boolean domain conditioning
 """
 
+import logging
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Dict, Optional
 from src.constants import (
-    HIDDEN_DIM, D_MODEL, FINGERPRINT_DIM,
+    HIDDEN_DIM, D_MODEL, FINGERPRINT_DIM, VOCAB_SIZE,
     SCALED_HIDDEN_DIM, SCALED_D_MODEL, SCALED_D_FF,
     SCALED_NUM_DECODER_LAYERS, SCALED_NUM_DECODER_HEADS, SCALED_MAX_SEQ_LEN,
     NUM_NODE_TYPES_HETEROGENEOUS, NUM_OPTIMIZED_EDGE_TYPES
 )
+
+logger = logging.getLogger(__name__)
 from src.models.encoder import (
     GATJKNetEncoder, GGNNEncoder, GraphReadout, FingerprintEncoder,
     HGTEncoder, RGCNEncoder, ScaledGraphReadout
@@ -136,6 +140,81 @@ class MBADeobfuscator(nn.Module):
         if self.boolean_domain_embed is not None:
             nn.init.normal_(self.boolean_domain_embed.weight, mean=0, std=0.02)
 
+    def _compute_copy_distribution(
+        self,
+        vocab_logits: torch.Tensor,
+        copy_attn: torch.Tensor,
+        p_gen: torch.Tensor,
+        source_tokens: torch.Tensor,
+        memory_mask: Optional[torch.Tensor] = None,
+        vocab_size: int = VOCAB_SIZE,
+    ) -> torch.Tensor:
+        """
+        Compute final distribution mixing generation and copying.
+
+        Args:
+            vocab_logits: [batch, tgt_len, vocab_size] vocabulary logits
+            copy_attn: [batch, tgt_len, src_len] copy attention weights
+            p_gen: [batch, tgt_len, 1] generation probability
+            source_tokens: [batch, src_len] input token IDs
+            memory_mask: [batch, src_len] padding mask (True = masked position)
+            vocab_size: Vocabulary size for output distribution
+
+        Returns:
+            [batch, tgt_len, vocab_size] final logits
+        """
+        batch_size, tgt_len, _ = vocab_logits.shape
+        _, src_len = source_tokens.shape
+
+        # Input validation
+        if not torch.isfinite(copy_attn).all():
+            raise ValueError("copy_attn contains NaN/Inf values")
+        if not torch.isfinite(vocab_logits).all():
+            raise ValueError("vocab_logits contains NaN/Inf values")
+
+        # Shape validation
+        if copy_attn.shape[2] != src_len:
+            raise ValueError(
+                f"Shape mismatch: copy_attn has src_len={copy_attn.shape[2]} "
+                f"but source_tokens has src_len={src_len}"
+            )
+
+        # Convert logits to probabilities
+        vocab_dist = F.softmax(vocab_logits, dim=-1)
+
+        # Apply memory mask to copy attention
+        if memory_mask is not None:
+            mask_expanded = memory_mask.unsqueeze(1).expand(-1, tgt_len, -1)
+            copy_attn_masked = copy_attn.masked_fill(mask_expanded, 0.0)
+        else:
+            copy_attn_masked = copy_attn
+
+        # Clamp source tokens to valid vocab range
+        source_tokens_clamped = torch.clamp(source_tokens, 0, vocab_size - 1)
+        if (source_tokens != source_tokens_clamped).any():
+            logger.warning(
+                f"Out-of-bounds token IDs clamped. Max ID: {source_tokens.max()}, vocab_size: {vocab_size}"
+            )
+
+        # Initialize copy distribution
+        copy_dist = torch.zeros_like(vocab_dist)
+
+        # Scatter copy attention to vocabulary indices
+        copy_dist.scatter_add_(
+            dim=2,
+            index=source_tokens_clamped.unsqueeze(1).expand(-1, tgt_len, -1),
+            src=copy_attn_masked,
+        )
+
+        # Mix distributions
+        p_gen_expanded = p_gen.expand(-1, -1, vocab_size)
+        final_dist = p_gen_expanded * vocab_dist + (1 - p_gen_expanded) * copy_dist
+
+        # Convert back to logits (epsilon prevents log(0))
+        final_logits = torch.log(final_dist + 1e-10)
+
+        return final_logits
+
     def encode(self, graph_batch, fingerprint: torch.Tensor,
                boolean_domain_only: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -187,35 +266,55 @@ class MBADeobfuscator(nn.Module):
 
         return context
 
-    def decode(self, tgt: torch.Tensor, memory: torch.Tensor,
-               tgt_mask: Optional[torch.Tensor] = None,
-               memory_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    def decode(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        source_tokens: Optional[torch.Tensor] = None,
+        tgt_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Decode step.
 
         Args:
             tgt: [batch, tgt_len] target token IDs
             memory: [batch, src_len, D_MODEL] encoder context
+            source_tokens: [batch, src_len] input token IDs for copy mechanism (optional)
             tgt_mask: [tgt_len, tgt_len] causal mask
             memory_mask: [batch, src_len] memory mask
 
         Returns:
-            Dict with vocab_logits, copy_attn, p_gen, decoder_out
+            Dict with vocab_logits, copy_attn, p_gen, decoder_out, [final_logits]
         """
         decoder_out, copy_attn, p_gen = self.decoder(tgt, memory, tgt_mask, memory_mask)
 
         vocab_logits = self.token_head(decoder_out)
 
-        return {
+        result = {
             'vocab_logits': vocab_logits,
             'copy_attn': copy_attn,
             'p_gen': p_gen,
-            'decoder_out': decoder_out  # Include decoder output for ComplexityHead
+            'decoder_out': decoder_out,
         }
 
-    def forward(self, graph_batch, fingerprint: torch.Tensor,
-                tgt: torch.Tensor,
-                boolean_domain_only: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        # Compute final distribution if source tokens provided
+        if source_tokens is not None:
+            final_logits = self._compute_copy_distribution(
+                vocab_logits, copy_attn, p_gen, source_tokens, memory_mask
+            )
+            result['final_logits'] = final_logits
+
+        return result
+
+    def forward(
+        self,
+        graph_batch,
+        fingerprint: torch.Tensor,
+        tgt: torch.Tensor,
+        source_tokens: Optional[torch.Tensor] = None,
+        boolean_domain_only: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Full forward pass for training.
 
@@ -223,32 +322,39 @@ class MBADeobfuscator(nn.Module):
             graph_batch: PyG batch of input graphs
             fingerprint: [batch, FINGERPRINT_DIM] semantic fingerprints
             tgt: [batch, tgt_len] target token IDs
+            source_tokens: [batch, src_len] input token IDs for copy mechanism (optional)
             boolean_domain_only: [batch] bool tensor for domain conditioning (scaled model)
 
         Returns:
-            Dict with: vocab_logits, copy_attn, p_gen, length_pred, depth_pred, value
+            Dict with: vocab_logits, copy_attn, p_gen, length_pred, depth_pred, value,
+                       final_logits (if source_tokens provided)
         """
         memory = self.encode(graph_batch, fingerprint, boolean_domain_only)
 
-        decode_output = self.decode(tgt, memory)
+        decode_output = self.decode(tgt, memory, source_tokens=source_tokens)
 
         # Use final token from decoder output for complexity prediction
-        # ComplexityHead predicts OUTPUT properties, not INPUT properties
-        decoder_final = decode_output['decoder_out'][:, -1, :]  # [batch, d_model]
+        decoder_final = decode_output['decoder_out'][:, -1, :]
         length_pred, depth_pred = self.complexity_head(decoder_final)
 
-        # ValueHead uses encoder output (graph embedding) to estimate P(simplifiable)
-        encoder_embedding = memory.squeeze(1)  # [batch, d_model]
+        # ValueHead uses encoder output to estimate P(simplifiable)
+        encoder_embedding = memory.squeeze(1)
         value = self.value_head(encoder_embedding)
 
-        return {
+        result = {
             'vocab_logits': decode_output['vocab_logits'],
             'copy_attn': decode_output['copy_attn'],
             'p_gen': decode_output['p_gen'],
             'length_pred': length_pred,
             'depth_pred': depth_pred,
-            'value': value
+            'value': value,
         }
+
+        # Include final_logits if copy mechanism was used
+        if 'final_logits' in decode_output:
+            result['final_logits'] = decode_output['final_logits']
+
+        return result
 
     def get_value(self, graph_batch, fingerprint: torch.Tensor,
                   boolean_domain_only: Optional[torch.Tensor] = None) -> torch.Tensor:
