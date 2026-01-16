@@ -1,0 +1,39 @@
+# Example configuration for MBA Deobfuscator
+# This is a sample config file showing the structure
+
+model:
+  hidden_dim: 256
+  num_encoder_layers: 4
+  num_encoder_heads: 8
+  encoder_dropout: 0.1
+
+  d_model: 512
+  num_decoder_layers: 6
+  num_decoder_heads: 8
+  d_ff: 2048
+  decoder_dropout: 0.1
+
+training:
+  batch_size: 32
+  learning_rate: 0.001
+  epochs: 50
+  warmup_steps: 1000
+  gradient_clip: 1.0
+
+data:
+  train_path: "data/train.json"
+  val_path: "data/val.json"
+  test_path: "data/test.json"
+  max_depth: 14
+  num_samples: 1000000
+
+wandb:
+  enabled: true
+  project: "mba-deobfuscator"
+  entity: null
+
+inference:
+  beam_width: 50
+  beam_diversity_groups: 4
+  z3_timeout_ms: 1000
+  htps_budget: 500

@@ -1,0 +1,104 @@
+# Scaled MBA Deobfuscator Configuration (~360M parameters)
+# Chinchilla-optimal for 12M samples (7.2B tokens)
+#
+# Parameter breakdown:
+#   Encoder (HGT/RGCN): ~60M params
+#   Decoder (Transformer): ~302M params (8 layers x ~37.7M/layer)
+#   Total: ~362M params
+
+model:
+  encoder_type: "hgt"  # Options: "hgt" (default), "rgcn"
+
+  # Encoder (HGT/RGCN) - ~60M params
+  hidden_dim: 768
+  num_encoder_layers: 12
+  num_encoder_heads: 16
+  encoder_dropout: 0.1
+  num_node_types: 10  # ADD,SUB,MUL,NEG,AND,OR,XOR,NOT,VAR,CONST
+  num_edge_types: 7   # LEFT/RIGHT/UNARY_OPERAND + inverses + DOMAIN_BRIDGE
+
+  # Decoder (Transformer) - ~302M params
+  d_model: 1536
+  num_decoder_layers: 8
+  num_decoder_heads: 24
+  d_ff: 6144
+  decoder_dropout: 0.1
+  max_seq_len: 2048
+
+  # Vocabulary
+  vocab_size: 300
+
+training:
+  # Phase 2: Supervised with curriculum
+  batch_size: 16  # Reduced for memory (adjust with gradient accumulation)
+  gradient_accumulation_steps: 4  # Effective batch size = 64
+  learning_rate: 0.0001  # Lower LR for larger model
+  weight_decay: 0.01
+  warmup_steps: 2000
+  gradient_clip: 1.0
+
+  # Mixed precision for memory efficiency
+  mixed_precision: true
+  gradient_checkpointing: true
+
+  # Curriculum learning stages (1.5x epochs for scaled model)
+  curriculum:
+    - max_depth: 2
+      epochs: 15
+      target_accuracy: 0.95
+    - max_depth: 5
+      epochs: 23
+      target_accuracy: 0.90
+    - max_depth: 10
+      epochs: 23
+      target_accuracy: 0.85
+    - max_depth: 14
+      epochs: 15
+      target_accuracy: 0.80
+
+  # Loss weights
+  ce_weight: 1.0
+  complexity_weight: 0.1
+  copy_weight: 0.1
+
+data:
+  train_path: "data/scaled_train.jsonl"
+  val_path: "data/scaled_val.jsonl"
+  test_path: "data/scaled_test.jsonl"
+  max_depth: 14
+  num_samples: 12000000  # 12M samples
+
+  # Dataset features
+  use_subexpr_sharing: true  # +3-5% accuracy, 3x fewer edges
+  use_precomputed_fingerprints: true  # From JSON Schema v6
+
+wandb:
+  enabled: true
+  project: "mba-deobfuscator-scaled"
+  entity: null
+  tags:
+    - "360M"
+    - "chinchilla"
+    - "hgt"
+
+inference:
+  beam_width: 50
+  beam_diversity_groups: 4
+  beam_diversity_penalty: 0.5
+  beam_temperature: 0.7
+  z3_timeout_ms: 1000
+  z3_top_k: 10
+  htps_budget: 500
+  htps_depth_threshold: 10
+
+# Memory estimation (A100 80GB)
+# Activation memory per sample: batch * heads * seq^2 * bytes * layers
+# 16 * 24 * 2048^2 * 2 * 8 = ~25.6 GB
+# With gradient checkpointing: ~8-10 GB
+# Safe batch_size: 16 (with checkpointing) or 4-8 (without)
+
+# Hardware recommendations
+hardware:
+  min_gpu_memory_gb: 40  # A100 40GB minimum
+  recommended_gpu_memory_gb: 80  # A100 80GB for full batch
+  num_gpus: 1  # Can scale to multi-GPU with DDP

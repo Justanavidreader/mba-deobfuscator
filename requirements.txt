@@ -1,0 +1,21 @@
+# Core ML Framework
+torch>=2.0.0
+torch-geometric>=2.3.0
+
+# Data Processing
+numpy>=1.24.0
+
+# Z3 Theorem Prover
+z3-solver>=4.12.0
+
+# Training & Monitoring
+tensorboard>=2.13.0
+wandb>=0.15.0
+
+# Utilities
+pyyaml>=6.0
+tqdm>=4.65.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
