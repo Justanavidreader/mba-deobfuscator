@@ -40,7 +40,6 @@ env/
 .ipynb_checkpoints/
 
 # Data and checkpoints
-data/
 checkpoints/
 *.pt
 *.pth
