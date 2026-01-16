@@ -23,6 +23,10 @@ def _get_encoder_classes() -> Dict[str, Type[BaseEncoder]]:
         HybridGREATEncoder,
         TransformerOnlyEncoder,
     )
+    from src.models.gmn import (
+        HGTWithGMN,
+        GATWithGMN,
+    )
 
     return {
         "gat_jknet": GATJKNetEncoder,
@@ -31,6 +35,9 @@ def _get_encoder_classes() -> Dict[str, Type[BaseEncoder]]:
         "rgcn": RGCNEncoder,
         "transformer_only": TransformerOnlyEncoder,
         "hybrid_great": HybridGREATEncoder,
+        # GMN-enhanced encoders (require special initialization with checkpoint)
+        "hgt_gmn": HGTWithGMN,
+        "gat_gmn": GATWithGMN,
     }
 
 
@@ -90,7 +97,8 @@ def list_encoders() -> Dict[str, Dict]:
 
 
 # Encoder groups for ablation study organization
-HOMOGENEOUS_ENCODERS = ["gat_jknet", "transformer_only", "hybrid_great"]
-HETEROGENEOUS_ENCODERS = ["ggnn", "hgt", "rgcn"]
+HOMOGENEOUS_ENCODERS = ["gat_jknet", "transformer_only", "hybrid_great", "gat_gmn"]
+HETEROGENEOUS_ENCODERS = ["ggnn", "hgt", "rgcn", "hgt_gmn"]
 SEQUENCE_ENCODERS = ["transformer_only"]
-GRAPH_ENCODERS = ["gat_jknet", "ggnn", "hgt", "rgcn", "hybrid_great"]
+GRAPH_ENCODERS = ["gat_jknet", "ggnn", "hgt", "rgcn", "hybrid_great", "hgt_gmn", "gat_gmn"]
+GMN_ENCODERS = ["hgt_gmn", "gat_gmn"]  # Encoders with graph matching capability

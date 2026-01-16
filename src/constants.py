@@ -30,8 +30,10 @@ NUM_NODE_TYPES: int = len(NODE_TYPES)
 NODE_DIM: int = 32  # Node feature dimension (one-hot + positional info)
 
 # =============================================================================
-# EDGE TYPES (for GGNN)
+# EDGE TYPES (Legacy 6-type system for GGNN)
 # =============================================================================
+# DEPRECATED: Use OPTIMIZED_EDGE_TYPES for HGT/RGCN encoders.
+# Kept for backward compatibility with existing datasets.
 
 EDGE_TYPES: Dict[str, int] = {
     'CHILD_LEFT': 0,   # parent -> left operand
@@ -43,6 +45,23 @@ EDGE_TYPES: Dict[str, int] = {
 }
 
 NUM_EDGE_TYPES: int = len(EDGE_TYPES)
+
+# =============================================================================
+# OPTIMIZED EDGE TYPES (8-type system for HGT/RGCN)
+# =============================================================================
+# Bidirectional edges with position-aware inverses and domain bridges.
+# See src/models/edge_types.py EdgeType enum for helper methods.
+
+OPTIMIZED_EDGE_TYPES: Dict[str, int] = {
+    'LEFT_OPERAND': 0,       # Binary op -> left child
+    'RIGHT_OPERAND': 1,      # Binary op -> right child
+    'UNARY_OPERAND': 2,      # Unary op (NOT, NEG) -> child
+    'LEFT_OPERAND_INV': 3,   # Left child -> parent (inverse of LEFT_OPERAND)
+    'RIGHT_OPERAND_INV': 4,  # Right child -> parent (inverse of RIGHT_OPERAND)
+    'UNARY_OPERAND_INV': 5,  # Child -> unary parent (inverse of UNARY_OPERAND)
+    'DOMAIN_BRIDGE_DOWN': 6, # Bool parent -> arith child (cross-domain)
+    'DOMAIN_BRIDGE_UP': 7,   # Arith child -> bool parent (cross-domain inverse)
+}
 
 # =============================================================================
 # TOKENIZER / VOCABULARY
@@ -231,6 +250,64 @@ SCALED_MAX_SEQ_LEN: int = 2048
 NUM_OPTIMIZED_EDGE_TYPES: int = 8   # LEFT/RIGHT/UNARY_OPERAND + inverses + DOMAIN_BRIDGE_DOWN/UP
 NUM_NODE_TYPES_HETEROGENEOUS: int = 10  # ADD,SUB,MUL,NEG,AND,OR,XOR,NOT,VAR,CONST
 
+# =============================================================================
+# GLOBAL ATTENTION (GraphGPS-style hybrid)
+# =============================================================================
+# Optional global self-attention interleaved with HGT local message passing.
+# Enables O(1) detection of repeated subexpressions instead of O(depth) propagation.
+
+HGT_USE_GLOBAL_ATTENTION: bool = False  # Default off for backward compatibility
+HGT_GLOBAL_ATTN_INTERVAL: int = 2       # Insert global attention every N HGT layers
+HGT_GLOBAL_ATTN_HEADS: int = 8          # Attention heads for global attention
+HGT_GLOBAL_ATTN_FFN_RATIO: float = 4.0  # FFN hidden dim multiplier
+HGT_GLOBAL_ATTN_CHECKPOINT: bool = True # Gradient checkpointing to reduce memory
+
+# =============================================================================
+# PATH-BASED EDGE ENCODING
+# =============================================================================
+# Aggregates information along all paths between edge endpoints.
+# Enables recognition of shared subexpressions in MBA DAGs.
+
+PATH_ENCODING_ENABLED: bool = False      # Default off for backward compatibility
+PATH_MAX_LENGTH: int = 6                 # Maximum path length to consider
+PATH_MAX_PATHS: int = 16                 # Maximum paths per edge
+PATH_AGGREGATION: str = 'mean'           # 'mean', 'max', or 'attention'
+PATH_USE_TRANSFORMER: bool = True        # Use Transformer (True) or LSTM (False)
+PATH_WARN_TRUNCATION: bool = False       # Log when paths are truncated
+
+# Path encoding integration with GNN encoders
+GGNN_USE_PATH_ENCODING: bool = False     # Enable path encoding in GGNN
+HGT_USE_PATH_ENCODING: bool = False      # Enable path encoding in HGT
+HGT_PATH_INJECTION_INTERVAL: int = 2     # Inject path context every N HGT layers
+HGT_PATH_INJECTION_SCALE: float = 0.1    # Scale factor for path context residual
+
+# =============================================================================
+# DAG POSITIONAL FEATURES
+# =============================================================================
+# Structural features for DAG-aware positional encoding.
+# Captures shared subexpressions and reachability information.
+
+DAG_FEATURE_DIM: int = 4  # [depth, subtree_size, in_degree, is_shared]
+
+# DAG feature integration with encoders (opt-in, backward compatible)
+USE_DAG_FEATURES: bool = False              # Global default
+GGNN_USE_DAG_FEATURES: bool = False         # GGNN-specific
+HGT_USE_DAG_FEATURES: bool = False          # HGT-specific
+
+# Fusion method per encoder
+HGT_DAG_FUSION_METHOD: str = 'concat'       # 'concat' or 'residual'
+GGNN_DAG_FUSION_METHOD: str = 'residual'    # GGNN always uses residual
+
+# =============================================================================
+# VARIABLE PERMUTATION AUGMENTATION
+# =============================================================================
+# Prevents model from memorizing variable name patterns by randomly permuting
+# variable names during training while keeping obfuscated/simplified pairs consistent.
+
+VAR_AUGMENT_ENABLED: bool = True         # Enable variable permutation by default
+VAR_AUGMENT_PROB: float = 0.8            # Probability of applying permutation
+VAR_CANONICAL_NAMES: List[str] = [f'x{i}' for i in range(8)]  # x0, x1, ..., x7
+
 # Scaled curriculum (1.5× epochs for larger model)
 SCALED_CURRICULUM_STAGES: List[Dict] = [
     {'max_depth': 2, 'epochs': 15, 'target': 0.95},
@@ -238,6 +315,18 @@ SCALED_CURRICULUM_STAGES: List[Dict] = [
     {'max_depth': 10, 'epochs': 23, 'target': 0.85},
     {'max_depth': 14, 'epochs': 15, 'target': 0.80},
 ]
+
+# =============================================================================
+# OPERATION-AWARE AGGREGATION
+# =============================================================================
+# Commutative operations use order-invariant sum aggregation.
+# Non-commutative operations preserve operand order via concatenation + projection.
+
+COMMUTATIVE_OPS: frozenset = frozenset({'ADD', 'MUL', 'AND', 'OR', 'XOR'})
+NON_COMMUTATIVE_OPS: frozenset = frozenset({'SUB'})
+
+# Unary operations skip binary aggregation (NOT, NEG have single operand)
+UNARY_OPS: frozenset = frozenset({'NOT', 'NEG'})
 
 # =============================================================================
 # ABLATION STUDY PARAMETERS

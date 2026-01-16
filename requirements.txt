@@ -1,14 +1,26 @@
-# Core ML Framework
-torch>=2.0.0
-torch-geometric>=2.3.0
+# =============================================================================
+# MBA Deobfuscator Dependencies
+# =============================================================================
+#
+# RECOMMENDED: Use setup.sh (Linux/cloud) or setup.ps1 (Windows) for automatic
+# CUDA detection and proper PyTorch/PyG installation.
+#
+# For manual installation:
+#   1. Install PyTorch: https://pytorch.org/get-started/locally/
+#   2. Install PyG extensions: https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
+#   3. pip install -r requirements.txt
+#
+# =============================================================================
 
-# Data Processing
+# Note: torch, torchvision, torch-geometric, torch-scatter, torch-sparse
+# must be installed separately with matching CUDA versions.
+# See setup.sh for automatic installation.
+
+# Core dependencies
 numpy>=1.24.0
-
-# Z3 Theorem Prover
 z3-solver>=4.12.0
 
-# Training & Monitoring
+# Training & monitoring
 tensorboard>=2.13.0
 wandb>=0.15.0
 
@@ -16,6 +28,6 @@ wandb>=0.15.0
 pyyaml>=6.0
 tqdm>=4.65.0
 
-# Testing
+# Testing (optional)
 pytest>=7.4.0
 pytest-cov>=4.1.0

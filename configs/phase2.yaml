@@ -1,0 +1,93 @@
+# Phase 2: Supervised Training with Curriculum Learning
+# Trains full encoder-decoder model with curriculum stages
+
+model:
+  encoder_type: gat  # gat, ggnn, hgt, rgcn
+  hidden_dim: 256
+  num_encoder_layers: 4
+  num_encoder_heads: 8
+  encoder_dropout: 0.1
+
+  # Edge type system: "legacy" (6-type) or "optimized" (8-type)
+  # Use "legacy" for backward compatibility with existing datasets
+  # Use "optimized" for HGT/RGCN encoders (required) or improved GGNN
+  edge_type_mode: legacy
+
+  # Advanced encoder features (experimental)
+  use_global_attention: false  # GraphGPS-style hybrid (global + local attention)
+  global_attn_interval: 2      # Insert global attention every N layers
+  global_attn_heads: 8         # Attention heads for global blocks
+
+  use_path_encoding: false     # Path-based edge encoding for subexpression detection
+  path_max_length: 6           # Maximum path length to consider
+  path_max_paths: 16           # Maximum paths per edge pair
+
+  # Operation-aware aggregation (HGT encoder only, ignored for gat/ggnn/rgcn)
+  # When encoder_type is 'hgt', this enables operation-specific message aggregation:
+  # - Commutative ops (ADD, MUL, AND, OR, XOR): order-invariant sum
+  # - Non-commutative ops (SUB): order-preserving concat + projection
+  operation_aware: false
+  operation_aware_strict: true
+
+  d_model: 512
+  num_decoder_layers: 6
+  num_decoder_heads: 8
+  d_ff: 2048
+  decoder_dropout: 0.1
+
+training:
+  # Optimizer
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  warmup_steps: 4000
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  scheduler_type: cosine
+
+  # Training
+  batch_size: 32
+  num_workers: 4
+
+  # Loss weights
+  ce_weight: 1.0
+  complexity_weight: 0.1
+  copy_weight: 0.1
+
+  # Curriculum learning (4 stages)
+  curriculum_stages:
+    - max_depth: 2
+      epochs: 10
+      target: 0.95
+    - max_depth: 5
+      epochs: 15
+      target: 0.90
+    - max_depth: 10
+      epochs: 15
+      target: 0.80
+    - max_depth: 14
+      epochs: 10
+      target: 0.70
+
+  # Self-paced learning
+  use_self_paced: true
+  sp_lambda_init: 0.5
+  sp_lambda_growth: 1.1
+  sp_lambda_max: 10.0  # Cap to prevent ineffective filtering
+
+  # Logging
+  log_interval: 100
+  eval_interval: 1
+  save_interval: 5
+
+data:
+  train_path: data/train.jsonl
+  val_path: data/val.jsonl
+
+checkpoint:
+  dir: checkpoints/phase2
+  resume_from: null  # Or path to Phase 1 checkpoint
+  load_phase1: checkpoints/phase1/phase1_best.pt  # Load pretrained encoder
+
+logging:
+  tensorboard: true
+  log_dir: logs/phase2

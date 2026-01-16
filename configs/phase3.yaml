@@ -1,0 +1,77 @@
+# Phase 3: Reinforcement Learning with PPO
+# Fine-tunes model using equivalence verification rewards
+
+model:
+  # Base encoder configuration (for model initialization)
+  # NOTE: Encoder weights are loaded from Phase 2 checkpoint
+  encoder_type: gat  # gat, ggnn, hgt, rgcn
+  hidden_dim: 256
+  num_encoder_layers: 4
+  num_encoder_heads: 8
+  encoder_dropout: 0.1
+
+  # Encoder configuration inherited from Phase 2 checkpoint
+  # Advanced features (use_global_attention, use_path_encoding, operation_aware)
+  # are frozen from Phase 2 training and cannot be modified in Phase 3.
+  # These settings should match the Phase 2 checkpoint being loaded.
+
+  d_model: 512
+  num_decoder_layers: 6
+  num_decoder_heads: 8
+  d_ff: 2048
+  decoder_dropout: 0.1
+
+training:
+  # Optimizer
+  learning_rate: 0.00001  # Lower LR for fine-tuning
+  weight_decay: 0.01
+  warmup_steps: 500
+  max_grad_norm: 0.5  # Tighter clipping for RL stability
+  gradient_accumulation_steps: 1
+  scheduler_type: constant
+
+  # Training
+  batch_size: 16  # Smaller batches for RL
+  num_epochs: 10
+  num_workers: 4
+
+  # PPO hyperparameters
+  ppo_epsilon: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  ppo_epochs: 4  # PPO update epochs per batch
+
+  # Sampling
+  sample_temperature: 1.0
+
+  # Verification (for speed, use exec only; enable Z3 for final runs)
+  verify_exec_only: true
+  exec_samples: 100
+
+  # Logging
+  log_interval: 50
+  eval_interval: 1
+  save_interval: 2
+
+data:
+  train_path: data/train.jsonl
+  val_path: data/val.jsonl
+  max_depth: 14  # Use full dataset for RL
+
+checkpoint:
+  dir: checkpoints/phase3
+  resume_from: null
+  load_phase2: checkpoints/phase2/phase2_best.pt  # Load supervised model
+
+logging:
+  tensorboard: true
+  log_dir: logs/phase3
+
+# Reward function weights (from constants.py)
+rewards:
+  equiv_bonus: 10.0
+  len_penalty: 0.1
+  depth_penalty: 0.2
+  identity_penalty: 5.0
+  syntax_error_penalty: 5.0
+  simplification_bonus: 2.0

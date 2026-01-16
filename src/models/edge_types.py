@@ -67,48 +67,52 @@ class EdgeType(IntEnum):
 class NodeType(IntEnum):
     """
     Node types for heterogeneous MBA expression graph.
-    10 types covering arithmetic, boolean, and terminal nodes.
+    10 types covering terminals, arithmetic, and boolean nodes.
+
+    IMPORTANT: This ordering MUST match src/constants.py NODE_TYPES.
     """
+    # Terminals (leaves)
+    VAR = 0      # Variables: x, y, z, ...
+    CONST = 1    # Constants: 0, 1, 2, ...
+
     # Arithmetic operators
-    ADD = 0
-    SUB = 1
-    MUL = 2
-    NEG = 3  # Unary negation
+    ADD = 2      # +
+    SUB = 3      # -
+    MUL = 4      # *
 
     # Boolean operators
-    AND = 4
-    OR = 5
-    XOR = 6
-    NOT = 7  # Unary boolean not
+    AND = 5      # &
+    OR = 6       # |
+    XOR = 7      # ^
 
-    # Terminals
-    VAR = 8
-    CONST = 9
+    # Unary operators
+    NOT = 8      # ~ (boolean)
+    NEG = 9      # unary - (arithmetic)
 
     @staticmethod
     def is_arithmetic(node_type: int) -> bool:
-        """Check if node is arithmetic operator."""
-        return node_type in [0, 1, 2, 3]
+        """Check if node is arithmetic operator (ADD, SUB, MUL, NEG)."""
+        return node_type in [2, 3, 4, 9]
 
     @staticmethod
     def is_boolean(node_type: int) -> bool:
-        """Check if node is boolean operator."""
-        return node_type in [4, 5, 6, 7]
+        """Check if node is boolean operator (AND, OR, XOR, NOT)."""
+        return node_type in [5, 6, 7, 8]
 
     @staticmethod
     def is_unary(node_type: int) -> bool:
-        """Check if node is unary operator (NEG or NOT)."""
-        return node_type in [3, 7]
+        """Check if node is unary operator (NOT or NEG)."""
+        return node_type in [8, 9]
 
     @staticmethod
     def is_binary(node_type: int) -> bool:
         """Check if node is binary operator."""
-        return node_type in [0, 1, 2, 4, 5, 6]
+        return node_type in [2, 3, 4, 5, 6, 7]
 
     @staticmethod
     def is_terminal(node_type: int) -> bool:
         """Check if node is terminal (VAR or CONST)."""
-        return node_type in [8, 9]
+        return node_type in [0, 1]
 
 
 # Mapping from string names to NodeType
@@ -146,3 +150,58 @@ LEGACY_EDGE_MAP: Dict[int, int] = {
 
 # Edge types that should be skipped when loading legacy datasets
 LEGACY_SKIP_TYPES: Set[int] = {2, 3, 4, 5}
+
+# Legacy node type ordering for backward compatibility with datasets
+# generated before 2026-01-15 (prior to NodeType enum reordering)
+LEGACY_NODE_ORDER = ['ADD', 'SUB', 'MUL', 'NEG', 'AND', 'OR', 'XOR', 'NOT', 'VAR', 'CONST']
+
+# Generated mapping from legacy IDs to current IDs
+# Legacy: ADD=0, SUB=1, MUL=2, NEG=3, AND=4, OR=5, XOR=6, NOT=7, VAR=8, CONST=9
+# Current: VAR=0, CONST=1, ADD=2, SUB=3, MUL=4, AND=5, OR=6, XOR=7, NOT=8, NEG=9
+LEGACY_NODE_MAP: Dict[int, int] = {
+    0: 2,   # ADD: 0 -> 2
+    1: 3,   # SUB: 1 -> 3
+    2: 4,   # MUL: 2 -> 4
+    3: 9,   # NEG: 3 -> 9
+    4: 5,   # AND: 4 -> 5
+    5: 6,   # OR: 5 -> 6
+    6: 7,   # XOR: 6 -> 7
+    7: 8,   # NOT: 7 -> 8
+    8: 0,   # VAR: 8 -> 0
+    9: 1,   # CONST: 9 -> 1
+}
+
+
+def convert_legacy_node_types(node_types: 'torch.Tensor') -> 'torch.Tensor':
+    """
+    Convert legacy node type IDs to current schema.
+
+    Legacy schema (pre-2026-01-15): ADD=0, SUB=1, ..., VAR=8, CONST=9
+    Current schema: VAR=0, CONST=1, ADD=2, SUB=3, ...
+
+    Args:
+        node_types: [num_nodes] tensor with legacy IDs (values in [0-9])
+
+    Returns:
+        [num_nodes] tensor with current IDs
+
+    Raises:
+        ValueError: If node_types contains IDs outside [0-9] range
+    """
+    import torch
+
+    if node_types.numel() == 0:
+        return node_types
+
+    min_id = node_types.min().item()
+    max_id = node_types.max().item()
+    if min_id < 0 or max_id > 9:
+        raise ValueError(
+            f"Node type IDs must be in [0-9] range, got [{min_id}, {max_id}]. "
+            f"Dataset may be corrupted or use unsupported schema version."
+        )
+
+    # Vectorized lookup table - O(N) time, O(1) extra memory
+    lookup = torch.tensor([LEGACY_NODE_MAP[i] for i in range(10)],
+                         dtype=node_types.dtype, device=node_types.device)
+    return lookup[node_types]

@@ -17,6 +17,25 @@ model:
   num_node_types: 10  # ADD,SUB,MUL,NEG,AND,OR,XOR,NOT,VAR,CONST
   num_edge_types: 8   # LEFT/RIGHT/UNARY_OPERAND + inverses + DOMAIN_BRIDGE_DOWN/UP
 
+  # Edge type system: HGT/RGCN require "optimized" (8-type)
+  edge_type_mode: optimized
+
+  # Advanced encoder features
+  use_global_attention: false  # GraphGPS-style hybrid (global + local attention)
+  global_attn_interval: 2      # Insert global attention every N layers
+  global_attn_heads: 16        # Attention heads for global blocks
+
+  use_path_encoding: false     # Path-based edge encoding for subexpression detection
+  path_max_length: 6           # Maximum path length to consider
+  path_max_paths: 16           # Maximum paths per edge pair
+  path_injection_interval: 2   # Inject path context every N HGT layers
+
+  # Operation-aware aggregation (HGT only)
+  # Commutative ops (ADD, MUL, AND, OR, XOR): order-invariant sum aggregation
+  # Non-commutative ops (SUB): order-preserving concat + projection
+  operation_aware: false  # Enable for +2-5% accuracy on SUB-heavy expressions
+  operation_aware_strict: true  # Raise errors on malformed graphs (set false for debugging)
+
   # Decoder (Transformer) - ~302M params
   d_model: 1536
   num_decoder_layers: 8

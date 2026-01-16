@@ -1,0 +1,67 @@
+# Phase 1c: End-to-End GMN Fine-Tuning
+# Unfreezes encoder for joint optimization with cross-attention
+
+model:
+  gmn_type: hgt_gmn
+
+  gmn_config:
+    hidden_dim: 768
+    num_attention_layers: 2
+    num_heads: 8
+    dropout: 0.1
+    aggregation: mean_max
+    freeze_encoder: false  # Critical for Phase 1c - encoder is unfrozen
+
+training:
+  # Dual learning rates (encoder lower than GMN)
+  learning_rate: 3.0e-5  # GMN learning rate
+  encoder_learning_rate: 3.0e-6  # Encoder learning rate (10x lower)
+  weight_decay: 0.01
+  encoder_weight_decay: 0.001  # Lower regularization for encoder
+  warmup_steps: 500  # Shorter warmup (already pre-trained)
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  scheduler_type: cosine
+  total_steps: 15000
+
+  # Training
+  batch_size: 16  # Smaller (full model gradients)
+  num_epochs: 5  # Short fine-tuning (avoid overfitting)
+  num_workers: 4
+
+  # Phase 1c specific
+  unfreeze_encoder: true  # Unfreeze encoder for joint training
+  bce_pos_weight: 1.0
+  triplet_loss_margin: 0.2  # Enable triplet loss for fine-tuning
+  triplet_loss_weight: 0.1
+  hard_negative_ratio: 0.7  # More hard negatives in fine-tuning
+
+  # Early stopping
+  early_stopping_patience: 3  # Stop if no improvement for 3 epochs
+  early_stopping_metric: separation_gap  # Monitor score separation
+
+  # Logging
+  log_interval: 50
+  eval_interval: 1
+  save_interval: 1
+
+data:
+  train_path: data/train.jsonl
+  val_path: data/val.jsonl
+  max_depth: null
+
+  negative_sampler:
+    z3_timeout_ms: 500
+    cache_size: 10000
+    num_workers: 4
+    negative_ratio: 1.5  # More negatives for fine-tuning
+    strategy: mixed
+
+checkpoint:
+  dir: checkpoints/phase1c_gmn_finetune
+  resume_from: null
+  load_phase1b: checkpoints/phase1b_gmn/phase1b_gmn_best.pt  # Phase 1b GMN checkpoint
+
+logging:
+  tensorboard: true
+  log_dir: logs/phase1c_gmn_finetune

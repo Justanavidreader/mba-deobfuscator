@@ -61,6 +61,7 @@ class BaseEncoder(ABC, nn.Module):
         edge_index: torch.Tensor,
         batch: torch.Tensor,
         edge_type: Optional[torch.Tensor] = None,
+        dag_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Encode graph to node embeddings.
@@ -72,6 +73,8 @@ class BaseEncoder(ABC, nn.Module):
             edge_index: [2, num_edges] edge indices
             batch: [total_nodes] batch assignment
             edge_type: [num_edges] edge type indices (required if requires_edge_types)
+            dag_pos: [total_nodes, 4] DAG positional features (optional)
+                     Columns: [depth, subtree_size, in_degree, is_shared]
 
         Returns:
             [total_nodes, hidden_dim] node embeddings
@@ -86,7 +89,7 @@ class BaseEncoder(ABC, nn.Module):
                 "Ensure your dataset provides edge_type for heterogeneous encoders."
             )
 
-        return self._forward_impl(x, edge_index, batch, edge_type)
+        return self._forward_impl(x, edge_index, batch, edge_type, dag_pos)
 
     @abstractmethod
     def _forward_impl(
@@ -95,12 +98,18 @@ class BaseEncoder(ABC, nn.Module):
         edge_index: torch.Tensor,
         batch: torch.Tensor,
         edge_type: Optional[torch.Tensor],
+        dag_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Implementation-specific forward pass.
 
         Subclasses implement this instead of forward() to ensure
         edge_type validation always runs first.
+
+        Args:
+            dag_pos: [total_nodes, 4] DAG positional features (optional)
+                     Columns: [depth, subtree_size, in_degree, is_shared]
+                     Encoders can ignore if USE_DAG_FEATURES is False.
         """
         pass
 

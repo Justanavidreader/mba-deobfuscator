@@ -1,0 +1,67 @@
+# Phase 1b: GMN Training with Frozen Encoder
+# Trains cross-attention layers while encoder remains frozen
+
+model:
+  # GMN wrapper type
+  gmn_type: hgt_gmn  # hgt_gmn or gat_gmn
+
+  # GMN configuration
+  gmn_config:
+    hidden_dim: 768  # Must match encoder output dimension
+    num_attention_layers: 2  # Stack depth for cross-attention
+    num_heads: 8  # Attention heads per layer
+    dropout: 0.1
+    aggregation: mean_max  # Graph-level pooling (mean_max, attention, mean, max)
+    freeze_encoder: true  # Critical for Phase 1b
+
+training:
+  # Optimizer (lower LR than Phase 1a)
+  learning_rate: 3.0e-5  # Lower LR for GMN training
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_grad_norm: 1.0  # Strict clipping for GMN attention stability
+  gradient_accumulation_steps: 1
+  scheduler_type: cosine
+  total_steps: 50000
+
+  # Training
+  batch_size: 32  # Smaller than Phase 1a (GMN is memory-intensive)
+  num_epochs: 15
+  num_workers: 4
+
+  # Phase 1b specific
+  # BCE positive class weight
+  # IMPORTANT: Set pos_weight = negative_ratio to balance loss when using imbalanced dataset
+  # Formula: pos_weight = (num_negatives / num_positives) = negative_ratio
+  # If set to 1.0, trainer will auto-adjust based on data.negative_sampler.negative_ratio
+  bce_pos_weight: 1.0
+  triplet_loss_margin: null  # Disable triplet loss (optional: 0.2)
+  triplet_loss_weight: 0.1  # Weight if enabled
+  hard_negative_ratio: 0.5  # 50% hard negatives, 50% random negatives
+
+  # Logging
+  log_interval: 50
+  eval_interval: 1
+  save_interval: 3
+
+data:
+  train_path: data/train.jsonl
+  val_path: data/val.jsonl
+  max_depth: null  # No depth filter
+
+  # Negative sampling
+  negative_sampler:
+    z3_timeout_ms: 500  # Z3 verification timeout per pair
+    cache_size: 10000  # LRU cache size for verified pairs
+    num_workers: 4  # Parallel Z3 workers
+    negative_ratio: 1.0  # Balanced dataset (1 negative per positive)
+    strategy: mixed  # Sampling strategy (random, syntactic, depth, variable, mixed)
+
+checkpoint:
+  dir: checkpoints/phase1b_gmn
+  resume_from: null  # Path to resume training
+  load_phase1a: checkpoints/phase1/phase1_best.pt  # Phase 1a encoder checkpoint
+
+logging:
+  tensorboard: true
+  log_dir: logs/phase1b_gmn
