@@ -734,3 +734,106 @@ def compute_advantages(
         # else: keep unnormalized advantages (uniform rewards case)
 
     return advantages, returns
+
+
+# =============================================================================
+# PROPERTY PREDICTION LOSSES (for Semantic HGT)
+# =============================================================================
+
+def compute_property_loss(
+    var_property_outputs: list,
+    property_labels: Optional[torch.Tensor] = None,
+    interaction_outputs: Optional[list] = None,
+    interaction_labels: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Compute auxiliary losses for property prediction.
+
+    Args:
+        var_property_outputs: List of dicts from VariablePropertyHead
+        property_labels: Ground truth property labels (if available)
+        interaction_outputs: List of dicts from InteractionPropertyHead
+        interaction_labels: Ground truth interaction labels (if available)
+
+    Returns:
+        Dict with 'var_loss', 'interaction_loss', 'total'
+    """
+    result = {}
+    total_loss = 0.0
+
+    # Variable property loss
+    if var_property_outputs and property_labels is not None:
+        all_logits = torch.cat([p['logits'] for p in var_property_outputs], dim=0)
+        var_loss = F.binary_cross_entropy_with_logits(all_logits, property_labels)
+        result['var_loss'] = var_loss
+        total_loss = total_loss + var_loss
+
+    # Interaction property loss
+    if interaction_outputs and interaction_labels is not None:
+        # Flatten pairwise predictions
+        all_int_logits = torch.cat([
+            p['logits'].view(-1, p['logits'].size(-1))
+            for p in interaction_outputs
+        ], dim=0)
+        int_loss = F.binary_cross_entropy_with_logits(
+            all_int_logits, interaction_labels.view(-1, interaction_labels.size(-1))
+        )
+        result['interaction_loss'] = int_loss
+        total_loss = total_loss + int_loss * 0.5  # Lower weight
+
+    result['total'] = total_loss
+    return result
+
+
+def compute_property_labels_from_fingerprint(
+    fingerprint: torch.Tensor,
+    threshold: float = 0.1,
+) -> torch.Tensor:
+    """
+    Heuristically derive property labels from fingerprint.
+
+    WARNING: This is a PLACEHOLDER implementation returning all zeros.
+    Property loss will be computed but provides no supervision signal.
+    Implement Z3-based label generation for real property detection.
+
+    Uses truth table portion to estimate:
+    - LINEAR: Check if truth table matches linear function pattern
+    - BOOLEAN_ONLY: High variation in truth table (non-constant)
+    - etc.
+
+    This is a weak supervision signal - not ground truth.
+
+    Args:
+        fingerprint: [batch_size, 448] semantic fingerprints
+        threshold: Threshold for binary decisions
+
+    Returns:
+        [batch_size, max_vars, NUM_VAR_PROPERTIES] estimated labels
+    """
+    import logging
+    from src.constants import NUM_VAR_PROPERTIES, MAX_VARS
+
+    batch_size = fingerprint.size(0)
+
+    # Log warning about placeholder implementation (RULE 2 SHOULD_FIX)
+    logger = logging.getLogger(__name__)
+    logger.warning(
+        "Using placeholder property labels (all zeros). "
+        "Property loss will not improve model. "
+        "Implement Z3 verification for accurate labels."
+    )
+
+    # Extract truth table (last 64 dims)
+    truth_table = fingerprint[:, -64:]  # [batch_size, 64]
+
+    # Simple heuristics (can be refined with Z3 verification)
+    # LINEAR: constant gradient in truth table
+    # For now, return zeros (weak supervision during warmup)
+
+    # This is a placeholder - real implementation should use:
+    # 1. Fingerprint analysis (fast)
+    # 2. Z3 verification (exact, but slow)
+    # 3. Pattern matching (heuristic)
+
+    return torch.zeros(batch_size, MAX_VARS, NUM_VAR_PROPERTIES,
+                      device=fingerprint.device)

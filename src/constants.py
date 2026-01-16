@@ -105,6 +105,11 @@ assert FINGERPRINT_DIM == 448, f"Fingerprint dimension mismatch: {FINGERPRINT_DI
 
 TRUTH_TABLE_VARS: int = 6     # Number of variables for truth table
 
+# Fingerprint mode: which components to use
+# - "full": All components (symbolic + corner + random + derivative + truth_table)
+# All components now deterministic (no RNG dependency)
+FINGERPRINT_MODE: str = "full"
+
 # Bit widths for evaluation
 BIT_WIDTHS: List[int] = [8, 16, 32, 64]
 
@@ -345,3 +350,51 @@ ABLATION_NUM_RUNS: int = 5
 
 # Significance level for statistical tests
 ABLATION_SIGNIFICANCE_LEVEL: float = 0.05
+
+# =============================================================================
+# SEMANTIC HGT CONSTANTS
+# =============================================================================
+# Configuration for Semantic HGT encoder with algebraic invariant detection.
+# Based on research: grokking (Fourier discovery), SiMBA (linear MBA verification),
+# Walsh-Hadamard transform for spectral feature extraction.
+
+# Variable property labels (multi-label per variable)
+VAR_PROPERTY_NAMES: List[str] = [
+    'LINEAR',           # Degree 1 in algebraic normal form
+    'QUADRATIC',        # Degree 2+ terms present
+    'BOOLEAN_ONLY',     # Only appears in &,|,^,~ operations
+    'ARITHMETIC_ONLY',  # Only appears in +,-,* operations
+    'MIXED_DOMAIN',     # Appears in both domains
+    'CONST_CONTRIB',    # Variable contribution cancels to constant
+    'COMPLEMENTARY',    # Has ~var nearby (potential cancellation)
+    'MASKED',           # ANDed with constant mask
+]
+NUM_VAR_PROPERTIES: int = len(VAR_PROPERTY_NAMES)
+
+# Interaction property labels (per variable pair)
+INTERACTION_PROPERTY_NAMES: List[str] = [
+    'INDEPENDENT',      # Variables don't share operations
+    'MULTIPLICATIVE',   # x*y terms present
+    'XOR_LIKE',         # Linear in GF(2) - x^y patterns
+    'MASK_PATTERN',     # x&m, x&~m patterns
+    'CANCELLATION',     # Sum to 0 or -1
+]
+NUM_INTERACTION_PROPERTIES: int = len(INTERACTION_PROPERTY_NAMES)
+
+# Semantic HGT architecture
+SEMANTIC_HGT_PROPERTY_DIM: int = 64          # Embedding dim for each property
+SEMANTIC_HGT_INTERACTION_HEADS: int = 4      # Heads for bilinear interaction attention
+SEMANTIC_HGT_WALSH_OUTPUT_DIM: int = 64      # Walsh spectrum embedding dimension
+SEMANTIC_HGT_SIGNATURE_DIM: int = 64         # SiMBA signature dimension (2^6 for 6 vars)
+
+# Walsh-Hadamard features
+WALSH_FEATURE_DIM: int = 17                  # Base Walsh features (statistics + indicators)
+WALSH_TOP_K_COEFFS: int = 16                 # Number of top Walsh coefficients to include
+WALSH_TOTAL_DIM: int = WALSH_FEATURE_DIM + WALSH_TOP_K_COEFFS  # = 33
+
+# Auxiliary loss weights
+PROPERTY_LOSS_WEIGHT: float = 0.1            # Weight for property prediction loss
+INTERACTION_LOSS_WEIGHT: float = 0.05        # Weight for interaction prediction loss
+
+# Walsh-Hadamard features (from fingerprint truth table)
+WALSH_SPECTRUM_ENABLED: bool = True          # Extract Walsh coefficients from truth table

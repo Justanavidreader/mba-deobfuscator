@@ -1,0 +1,56 @@
+# Semantic HGT Configuration for MBA Deobfuscation
+# Uses algebraic invariant detection for improved generalization
+
+model:
+  encoder_type: semantic_hgt
+  hidden_dim: 768
+  num_encoder_layers: 12
+  num_encoder_heads: 16
+  encoder_dropout: 0.1
+
+  # Semantic HGT specific
+  enable_property_detection: true
+  property_injection_layer: 8  # Inject after layer 8 of 12
+
+  # Decoder (same as scaled model)
+  d_model: 1536
+  num_decoder_layers: 8
+  num_decoder_heads: 24
+  d_ff: 6144
+  decoder_dropout: 0.1
+  max_seq_len: 2048
+
+training:
+  # Phase 2 settings
+  batch_size: 32
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 2000
+  max_epochs: 50
+
+  # Loss weights
+  ce_weight: 1.0
+  complexity_weight: 0.1
+  copy_weight: 0.1
+  property_loss_weight: 0.1  # Auxiliary property loss
+
+  # Curriculum
+  curriculum:
+    - {max_depth: 2, epochs: 10, target: 0.95}
+    - {max_depth: 5, epochs: 15, target: 0.90}
+    - {max_depth: 10, epochs: 15, target: 0.80}
+    - {max_depth: 14, epochs: 10, target: 0.70}
+
+data:
+  train_path: data/train.jsonl
+  val_path: data/val.jsonl
+  node_type_schema: current  # Use current schema (not legacy)
+  augment_variables: true
+  augment_prob: 0.8
+  use_dag_features: true
+
+logging:
+  log_dir: logs/semantic_hgt
+  checkpoint_dir: checkpoints/semantic_hgt
+  log_interval: 100
+  save_interval: 1000

@@ -218,6 +218,26 @@ class Phase2Trainer(BaseTrainer):
 
         total_loss = loss_dict['total']
 
+        # Auxiliary property loss (if using semantic HGT)
+        property_loss_value = 0.0
+        if hasattr(self.model, '_uses_semantic') and self.model._uses_semantic:
+            from src.training.losses import compute_property_loss, compute_property_labels_from_fingerprint
+            from src.constants import PROPERTY_LOSS_WEIGHT
+
+            # Get weak supervision labels from fingerprint
+            property_labels = compute_property_labels_from_fingerprint(batch['fingerprint'])
+
+            # Check if labels are non-zero (skip if placeholder zeros)
+            if property_labels.any():
+                prop_loss_dict = compute_property_loss(
+                    var_property_outputs=getattr(self.model, '_last_var_properties', []),
+                    property_labels=property_labels,
+                )
+
+                if prop_loss_dict['total'] > 0:
+                    total_loss = total_loss + PROPERTY_LOSS_WEIGHT * prop_loss_dict['total']
+                    property_loss_value = prop_loss_dict['total'].item()
+
         # Self-paced learning: weight samples by difficulty
         if self.use_self_paced:
             # Compute per-sample loss
@@ -232,12 +252,18 @@ class Phase2Trainer(BaseTrainer):
         # Backward pass
         self.backward(total_loss, update=True)
 
-        return {
+        result = {
             'total': total_loss.item(),
             'ce': loss_dict['ce'].item(),
             'complexity': loss_dict['complexity'].item(),
             'copy': loss_dict['copy'].item(),
         }
+
+        # Add property loss if using semantic HGT
+        if property_loss_value > 0:
+            result['property'] = property_loss_value
+
+        return result
 
     def _compute_sample_losses(
         self,

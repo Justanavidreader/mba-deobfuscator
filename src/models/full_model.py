@@ -23,6 +23,7 @@ from src.models.encoder import (
     GATJKNetEncoder, GGNNEncoder, GraphReadout, FingerprintEncoder,
     HGTEncoder, RGCNEncoder, ScaledGraphReadout
 )
+from src.models.semantic_hgt import SemanticHGTEncoder, PropertyAwareReadout
 from src.models.decoder import TransformerDecoderWithCopy
 from src.models.heads import TokenHead, ComplexityHead, ValueHead
 
@@ -43,7 +44,7 @@ class MBADeobfuscator(nn.Module):
         """
         super().__init__()
         self.encoder_type = encoder_type
-        self.is_scaled = encoder_type in ('hgt', 'rgcn')
+        self.is_scaled = encoder_type in ('hgt', 'rgcn', 'semantic_hgt')
 
         # Determine dimensions based on model type
         hidden_dim = kwargs.get('hidden_dim', SCALED_HIDDEN_DIM if self.is_scaled else HIDDEN_DIM)
@@ -78,6 +79,19 @@ class MBADeobfuscator(nn.Module):
                 dropout=kwargs.get('encoder_dropout', 0.1)
             )
             self.graph_readout = ScaledGraphReadout(hidden_dim=hidden_dim)
+        elif encoder_type == 'semantic_hgt':
+            self.graph_encoder = SemanticHGTEncoder(
+                hidden_dim=hidden_dim,
+                num_layers=kwargs.get('num_encoder_layers', 12),
+                num_heads=kwargs.get('num_encoder_heads', 16),
+                num_node_types=kwargs.get('num_node_types', NUM_NODE_TYPES_HETEROGENEOUS),
+                num_edge_types=kwargs.get('num_edge_types', NUM_OPTIMIZED_EDGE_TYPES),
+                dropout=kwargs.get('encoder_dropout', 0.1),
+                enable_property_detection=kwargs.get('enable_property_detection', True),
+                property_injection_layer=kwargs.get('property_injection_layer', 8),
+            )
+            self.graph_readout = PropertyAwareReadout(hidden_dim=hidden_dim)
+            self._uses_semantic = True
         else:
             raise ValueError(f"Unknown encoder type: {encoder_type}")
 
@@ -234,9 +248,25 @@ class MBADeobfuscator(nn.Module):
         batch = graph_batch.batch
 
         # All encoder types except GAT need edge_type
-        if self.encoder_type in ('ggnn', 'hgt', 'rgcn'):
+        if self.encoder_type in ('ggnn', 'hgt', 'rgcn', 'semantic_hgt'):
             edge_type = graph_batch.edge_type
-            node_embeddings = self.graph_encoder(x, edge_index, edge_type, batch)
+
+            # Semantic HGT returns dict with property outputs
+            if hasattr(self, '_uses_semantic') and self._uses_semantic:
+                encoder_output = self.graph_encoder(
+                    x, edge_index, edge_type, batch,
+                    fingerprint=fingerprint,
+                    return_property_outputs=True,
+                )
+                node_embeddings = encoder_output['embeddings']
+
+                # Store property outputs for auxiliary loss
+                self._last_var_properties = encoder_output.get('var_properties', [])
+                self._last_interactions = encoder_output.get('interactions', [])
+                self._last_walsh_features = encoder_output.get('walsh_features')
+                self._last_walsh_raw = encoder_output.get('walsh_raw')
+            else:
+                node_embeddings = self.graph_encoder(x, edge_index, edge_type, batch)
         else:
             node_embeddings = self.graph_encoder(x, edge_index, batch)
 
