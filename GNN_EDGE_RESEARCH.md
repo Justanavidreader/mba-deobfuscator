@@ -141,11 +141,11 @@ Heterogeneous typing enables operation-specific transformations—critical becau
 
 | Edge Type | Inverse | Purpose |
 |-----------|---------|---------|
-| LEFT_OPERAND | PARENT_OF_LEFT | Position-aware child edge |
-| RIGHT_OPERAND | PARENT_OF_RIGHT | Position-aware child edge |
-| UNARY_OPERAND | PARENT_OF_UNARY | For NOT, NEG |
+| LEFT_OPERAND | LEFT_OPERAND_INV | Position-aware child edge |
+| RIGHT_OPERAND | RIGHT_OPERAND_INV | Position-aware child edge |
+| UNARY_OPERAND | UNARY_OPERAND_INV | For NOT, NEG |
 | SUBEXPR_SHARED | — | Multiple parents for shared subexpressions |
-| DOMAIN_BRIDGE | — | Boolean↔arithmetic boundaries |
+| DOMAIN_BRIDGE_DOWN | DOMAIN_BRIDGE_UP | Boolean↔arithmetic boundaries (bidirectional) |
 
 **Compared to your current scheme:**
 
@@ -153,7 +153,7 @@ Heterogeneous typing enables operation-specific transformations—critical becau
 |-------------------|-----------|--------|
 | CHILD_LEFT | LEFT_OPERAND | Rename |
 | CHILD_RIGHT | RIGHT_OPERAND | Rename |
-| PARENT | Split into PARENT_OF_LEFT/RIGHT | More specific |
+| PARENT | Split into LEFT/RIGHT/UNARY_OPERAND_INV | Position-aware inverses |
 | SIBLING_NEXT | **Remove** | Redundant |
 | SIBLING_PREV | **Remove** | Redundant |
 | SAME_VAR | **Replace with subexpr sharing** | Architecture change |
@@ -290,18 +290,21 @@ def build_mba_graph(expression):
 
 ```python
 class EdgeType(Enum):
-    # Structural (with inverses)
+    # Structural (parent -> child)
     LEFT_OPERAND = 0
     RIGHT_OPERAND = 1
     UNARY_OPERAND = 2
-    PARENT_OF_LEFT = 3      # Inverse of LEFT_OPERAND
-    PARENT_OF_RIGHT = 4     # Inverse of RIGHT_OPERAND
-    PARENT_OF_UNARY = 5     # Inverse of UNARY_OPERAND
-    
-    # Semantic
-    DOMAIN_BRIDGE = 6       # Boolean ↔ Arithmetic boundary
-    
-    # Total: 7 edge types
+
+    # Structural inverse (child -> parent)
+    LEFT_OPERAND_INV = 3
+    RIGHT_OPERAND_INV = 4
+    UNARY_OPERAND_INV = 5
+
+    # Domain bridge (both directions, semantically distinct)
+    DOMAIN_BRIDGE_DOWN = 6  # Parent (domain A) -> Child (domain B)
+    DOMAIN_BRIDGE_UP = 7    # Child (domain B) -> Parent (domain A)
+
+    # Total: 8 edge types
 ```
 
 ### Architecture Summary
@@ -327,7 +330,7 @@ encoder:
 
 ## Expected Impact
 
-| Metric | Current (6 edge types) | Optimized (7 edge types + sharing) |
+| Metric | Current (6 edge types) | Optimized (8 edge types + sharing) |
 |--------|------------------------|-----------------------------------|
 | Edges per sample | ~300-600 | ~100-200 |
 | Variable identity | O(n²) SAME_VAR edges | Implicit via sharing |

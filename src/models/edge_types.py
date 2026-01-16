@@ -5,8 +5,8 @@ Optimized based on HOList research findings.
 Changes from original 6-type schema:
 - SIBLING_NEXT, SIBLING_PREV: Removed (redundant with tree structure)
 - SAME_VAR: Replaced by subexpression sharing in dataset loader
-- PARENT: Split into position-aware PARENT_OF_LEFT/RIGHT/UNARY
-- DOMAIN_BRIDGE: Added for Boolean<->Arithmetic transitions
+- PARENT: Split into position-aware inverses (LEFT_OPERAND_INV, etc.)
+- DOMAIN_BRIDGE: Split into DOMAIN_BRIDGE_DOWN/UP for bidirectional flow
 """
 
 from enum import IntEnum
@@ -17,43 +17,51 @@ class EdgeType(IntEnum):
     """
     Optimized edge types for MBA expression graphs.
     Bidirectional edges enable faster information propagation.
-    Total: 7 edge types (vs original 6, but more semantically meaningful)
+    Total: 8 edge types with semantically distinct directions.
     """
-    # Structural edges (operator -> operand)
-    LEFT_OPERAND = 0      # Binary operator to left child
-    RIGHT_OPERAND = 1     # Binary operator to right child
-    UNARY_OPERAND = 2     # Unary operator (NOT, NEG) to child
+    # Structural edges (parent -> child)
+    LEFT_OPERAND = 0       # Binary operator to left child
+    RIGHT_OPERAND = 1      # Binary operator to right child
+    UNARY_OPERAND = 2      # Unary operator (NOT, NEG) to child
 
-    # Inverse edges (operand -> operator) for bidirectional message passing
-    PARENT_OF_LEFT = 3    # Left child to parent operator
-    PARENT_OF_RIGHT = 4   # Right child to parent operator
-    PARENT_OF_UNARY = 5   # Child to unary parent operator
+    # Structural inverse edges (child -> parent) for bidirectional message passing
+    LEFT_OPERAND_INV = 3   # Left child to parent operator
+    RIGHT_OPERAND_INV = 4  # Right child to parent operator
+    UNARY_OPERAND_INV = 5  # Child to unary parent operator
 
-    # Semantic edges
-    DOMAIN_BRIDGE = 6     # Boolean <-> Arithmetic transition
+    # Domain bridge edges (both directions, semantically distinct)
+    DOMAIN_BRIDGE_DOWN = 6  # Parent (domain A) -> Child (domain B)
+    DOMAIN_BRIDGE_UP = 7    # Child (domain B) -> Parent (domain A)
 
     @staticmethod
     def get_inverse(edge_type: int) -> int:
         """Get inverse edge type for bidirectional flow."""
         inverse_map = {
-            0: 3,  # LEFT_OPERAND -> PARENT_OF_LEFT
-            1: 4,  # RIGHT_OPERAND -> PARENT_OF_RIGHT
-            2: 5,  # UNARY_OPERAND -> PARENT_OF_UNARY
-            3: 0,  # PARENT_OF_LEFT -> LEFT_OPERAND
-            4: 1,  # PARENT_OF_RIGHT -> RIGHT_OPERAND
-            5: 2,  # PARENT_OF_UNARY -> UNARY_OPERAND
+            0: 3,  # LEFT_OPERAND -> LEFT_OPERAND_INV
+            1: 4,  # RIGHT_OPERAND -> RIGHT_OPERAND_INV
+            2: 5,  # UNARY_OPERAND -> UNARY_OPERAND_INV
+            3: 0,  # LEFT_OPERAND_INV -> LEFT_OPERAND
+            4: 1,  # RIGHT_OPERAND_INV -> RIGHT_OPERAND
+            5: 2,  # UNARY_OPERAND_INV -> UNARY_OPERAND
+            6: 7,  # DOMAIN_BRIDGE_DOWN -> DOMAIN_BRIDGE_UP
+            7: 6,  # DOMAIN_BRIDGE_UP -> DOMAIN_BRIDGE_DOWN
         }
         return inverse_map.get(edge_type, edge_type)
 
     @staticmethod
     def is_forward_edge(edge_type: int) -> bool:
         """Check if edge is parent->child direction."""
-        return edge_type in [0, 1, 2]
+        return edge_type in [0, 1, 2, 6]
 
     @staticmethod
     def is_inverse_edge(edge_type: int) -> bool:
         """Check if edge is child->parent direction."""
-        return edge_type in [3, 4, 5]
+        return edge_type in [3, 4, 5, 7]
+
+    @staticmethod
+    def is_domain_bridge(edge_type: int) -> bool:
+        """Check if edge is a domain bridge (Boolean<->Arithmetic)."""
+        return edge_type in [6, 7]
 
 
 class NodeType(IntEnum):

@@ -401,7 +401,7 @@ hidden_dim: 768
 num_layers: 12
 num_heads: 16
 dropout: 0.1
-num_edge_types: 7
+num_edge_types: 8
 ```
 
 **Decoder (Transformer)**:

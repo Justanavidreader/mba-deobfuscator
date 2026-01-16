@@ -206,7 +206,7 @@ SAME_VAR      | 5  | var_use ↔ var_use  | x[node1] ↔ x[node2]
 - Constant value normalized to [-1,1] (1 dim)
 - Padding (12 dims)
 
-#### Optimized System (7 types)
+#### Optimized System (8 types)
 
 Used by `ast_to_optimized_graph()` for scaled model with subexpression sharing:
 
@@ -216,15 +216,18 @@ Edge Type          | ID | Direction      | Semantic
 LEFT_OPERAND       | 0  | parent → left   | Forward dataflow
 RIGHT_OPERAND      | 1  | parent → right  | Forward dataflow
 UNARY_OPERAND      | 2  | parent → child  | Forward dataflow
-PARENT_OF_LEFT     | 3  | left → parent   | Inverse (for GNN symmetry)
-PARENT_OF_RIGHT    | 4  | right → parent  | Inverse (for GNN symmetry)
-PARENT_OF_UNARY    | 5  | child → parent  | Inverse (for GNN symmetry)
-DOMAIN_BRIDGE      | 6  | bool → arith    | Cross-domain edge (e.g., & → +)
+LEFT_OPERAND_INV   | 3  | left → parent   | Inverse (for GNN symmetry)
+RIGHT_OPERAND_INV  | 4  | right → parent  | Inverse (for GNN symmetry)
+UNARY_OPERAND_INV  | 5  | child → parent  | Inverse (for GNN symmetry)
+DOMAIN_BRIDGE_DOWN | 6  | bool → arith    | Cross-domain (parent to child)
+DOMAIN_BRIDGE_UP   | 7  | arith → bool    | Cross-domain (child to parent)
 ```
 
 **Node Features**: `[num_nodes]` (just type IDs for heterogeneous GNN)
 
-**Domain Bridge Edges**: Added when boolean operator has arithmetic child (e.g., `(x+y) & 1` adds bridge from `&` to `+`).
+**Domain Bridge Edges**: Added bidirectionally when domains differ between parent and child:
+- `DOMAIN_BRIDGE_DOWN`: When Boolean parent has Arithmetic child (e.g., `& → +`)
+- `DOMAIN_BRIDGE_UP`: When Arithmetic child has Boolean parent (e.g., `+ → &`)
 
 **Subexpression Sharing**: Implemented in `ScaledMBADataset._build_optimized_graph()` via subtree hashing (MD5). Identical subtrees merge to single node with shared incoming edges.
 

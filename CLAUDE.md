@@ -71,7 +71,7 @@ python scripts/simplify.py --expr "(x&y)+(x^y)" --mode beam
 
 ### Encoder (choose one)
 - **GAT+JKNet**: 4 layers, 8 heads, 256d (~2.8M params) — *default, depth ≤10*
-- **GGNN**: 8 timesteps, 7 edge types, 256d (~3.2M params) — *depth 10+*
+- **GGNN**: 8 timesteps, 8 edge types, 256d (~3.2M params) — *depth 10+*
 - **HGT**: 12 layers, 16 heads, 768d (~60M params) — *scaled model*
 - **RGCN**: Relational GCN, alternative to GGNN (~60M params)
 

@@ -56,8 +56,8 @@ def create_dummy_batch(batch_size: int = 2, num_nodes: int = 50, device: str = '
         num_edges = num_nodes * 3
         edge_index = torch.randint(0, num_nodes, (2, num_edges), dtype=torch.long)
 
-        # Random edge types (0-6 for 7 edge types)
-        edge_type = torch.randint(0, 7, (num_edges,), dtype=torch.long)
+        # Random edge types (0-7 for 8 edge types)
+        edge_type = torch.randint(0, 8, (num_edges,), dtype=torch.long)
 
         graphs.append(Data(x=x, edge_index=edge_index, edge_type=edge_type))
 

@@ -206,14 +206,14 @@ x = jk_projection(jk_concat)              # [N, 1024] -> [N, 256]
 **Architecture**:
 - Gated Graph Neural Network with explicit edge types
 - 8 timesteps of recurrent message passing
-- 7 edge types: LEFT/RIGHT/UNARY_OPERAND + inverses + DOMAIN_BRIDGE
+- 8 edge types: LEFT/RIGHT/UNARY_OPERAND + inverses + DOMAIN_BRIDGE_DOWN/UP
 - GRU-based state update
 
 **Dimensions**:
 ```python
 hidden_dim = 256          # Node state dimension
 num_timesteps = 8         # Message passing rounds
-num_edge_types = 7        # Heterogeneous edges
+num_edge_types = 8        # Heterogeneous edges
 ```
 
 **Forward pass**:
@@ -644,15 +644,16 @@ Target: 12M samples (Chinchilla-optimal for 360M params), depth ≤14.
 
 Defined in `src/models/edge_types.py`:
 
-| Edge Type          | ID  | Direction         | Semantics                              |
-| ------------------ | --- | ----------------- | -------------------------------------- |
-| `LEFT_OPERAND`     | 0   | operator → left   | Parent to left child                   |
-| `RIGHT_OPERAND`    | 1   | operator → right  | Parent to right child                  |
-| `UNARY_OPERAND`    | 2   | operator → child  | Unary operator (NEG, NOT) to operand   |
-| `PARENT_OF_LEFT`   | 3   | left → operator   | Left child to parent (inverse)         |
-| `PARENT_OF_RIGHT`  | 4   | right → operator  | Right child to parent (inverse)        |
-| `PARENT_OF_UNARY`  | 5   | child → operator  | Child to unary parent (inverse)        |
-| `DOMAIN_BRIDGE`    | 6   | bidirectional     | Boolean ↔ Arithmetic transition        |
+| Edge Type            | ID  | Direction         | Semantics                              |
+| -------------------- | --- | ----------------- | -------------------------------------- |
+| `LEFT_OPERAND`       | 0   | operator → left   | Parent to left child                   |
+| `RIGHT_OPERAND`      | 1   | operator → right  | Parent to right child                  |
+| `UNARY_OPERAND`      | 2   | operator → child  | Unary operator (NEG, NOT) to operand   |
+| `LEFT_OPERAND_INV`   | 3   | left → operator   | Left child to parent (inverse)         |
+| `RIGHT_OPERAND_INV`  | 4   | right → operator  | Right child to parent (inverse)        |
+| `UNARY_OPERAND_INV`  | 5   | child → operator  | Child to unary parent (inverse)        |
+| `DOMAIN_BRIDGE_DOWN` | 6   | bool → arith      | Domain transition (parent to child)    |
+| `DOMAIN_BRIDGE_UP`   | 7   | arith → bool      | Domain transition (child to parent)    |
 
 **Why bidirectional edges?**:
 - Information flows both top-down (parent to children) and bottom-up (children to parent)
@@ -662,7 +663,9 @@ Defined in `src/models/edge_types.py`:
 **DOMAIN_BRIDGE edges**:
 - Connect Boolean operators to Arithmetic contexts (and vice versa)
 - Example: `(x & y) + (x ^ y)` — `&` and `^` are Boolean, `+` is Arithmetic
-- Bridge edges link `&→+` and `^→+` with `DOMAIN_BRIDGE` type
+- `DOMAIN_BRIDGE_DOWN`: Added when Boolean parent has Arithmetic child (e.g., `& → +`)
+- `DOMAIN_BRIDGE_UP`: Added when Arithmetic child has Boolean parent (e.g., `+ → &`)
+- Having separate UP/DOWN types lets the model learn different transformations for each direction
 - Helps model learn MBA transformation rules (Boolean-Arithmetic mixing)
 
 ---

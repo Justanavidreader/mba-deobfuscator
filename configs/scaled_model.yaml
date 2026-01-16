@@ -15,7 +15,7 @@ model:
   num_encoder_heads: 16
   encoder_dropout: 0.1
   num_node_types: 10  # ADD,SUB,MUL,NEG,AND,OR,XOR,NOT,VAR,CONST
-  num_edge_types: 7   # LEFT/RIGHT/UNARY_OPERAND + inverses + DOMAIN_BRIDGE
+  num_edge_types: 8   # LEFT/RIGHT/UNARY_OPERAND + inverses + DOMAIN_BRIDGE_DOWN/UP
 
   # Decoder (Transformer) - ~302M params
   d_model: 1536

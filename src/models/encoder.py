@@ -333,11 +333,15 @@ class HGTEncoder(BaseEncoder):
     REQUIRES edge types (heterogeneous GNN).
 
     IMPORTANT: This uses a pruned metadata set - only edge triplets that
-    actually occur in MBA expression graphs are registered, NOT all 700
-    theoretical combinations (10 node types × 7 edge types × 10 node types).
+    actually occur in MBA expression graphs are registered, NOT all 800
+    theoretical combinations (10 node types × 8 edge types × 10 node types).
     """
 
-    # Pre-computed valid edge triplets for MBA expressions (~35 combinations)
+    # Pre-computed valid edge triplets for MBA expressions (~40 combinations)
+    # Edge types: 0=LEFT_OPERAND, 1=RIGHT_OPERAND, 2=UNARY_OPERAND,
+    #             3=LEFT_OPERAND_INV, 4=RIGHT_OPERAND_INV, 5=UNARY_OPERAND_INV,
+    #             6=DOMAIN_BRIDGE_DOWN, 7=DOMAIN_BRIDGE_UP
+    # Node types: 0=ADD, 1=SUB, 2=MUL, 3=NEG, 4=AND, 5=OR, 6=XOR, 7=NOT, 8=VAR, 9=CONST
     VALID_TRIPLETS = [
         # Arithmetic operators to operands (LEFT/RIGHT_OPERAND)
         (0, 0, 8), (0, 1, 8), (0, 0, 9), (0, 1, 9),  # ADD -> VAR/CONST
@@ -347,16 +351,19 @@ class HGTEncoder(BaseEncoder):
         # Boolean operators to operands
         (4, 0, 8), (4, 1, 8), (5, 0, 8), (5, 1, 8),  # AND/OR -> VAR
         (6, 0, 8), (6, 1, 8), (7, 2, 8),  # XOR -> VAR, NOT -> VAR
-        # Inverse edges (operand -> operator)
-        (8, 3, 0), (8, 4, 0), (8, 3, 1), (8, 4, 1),  # VAR -> ADD/SUB
+        # Inverse edges (operand -> operator) using _INV edge types
+        (8, 3, 0), (8, 4, 0), (8, 3, 1), (8, 4, 1),  # VAR -> ADD/SUB (LEFT/RIGHT_INV)
         (8, 3, 2), (8, 4, 2), (8, 5, 3), (8, 5, 7),  # VAR -> MUL/NEG/NOT
         (9, 3, 0), (9, 4, 0), (9, 3, 2), (9, 4, 2),  # CONST -> operators
         # Nested operators (operator -> operator)
         (0, 0, 0), (0, 1, 0), (0, 0, 2), (0, 1, 2),  # ADD -> ADD/MUL
         (2, 0, 2), (2, 1, 2), (2, 0, 0), (2, 1, 0),  # MUL -> MUL/ADD
-        # Domain bridge (bool <-> arith)
+        # Domain bridge DOWN (bool parent -> arith child)
         (4, 6, 0), (4, 6, 1), (4, 6, 2),  # AND -> ADD/SUB/MUL
         (5, 6, 0), (5, 6, 1), (6, 6, 0),  # OR/XOR -> arith ops
+        # Domain bridge UP (arith child -> bool parent)
+        (0, 7, 4), (1, 7, 4), (2, 7, 4),  # ADD/SUB/MUL -> AND
+        (0, 7, 5), (1, 7, 5), (0, 7, 6),  # arith ops -> OR/XOR
     ]
 
     def __init__(
@@ -366,7 +373,7 @@ class HGTEncoder(BaseEncoder):
         num_heads: int = 16,
         dropout: float = 0.1,
         num_node_types: int = 10,
-        num_edge_types: int = 7,
+        num_edge_types: int = 8,
         **kwargs,
     ):
         super().__init__(hidden_dim=hidden_dim)
@@ -513,7 +520,7 @@ class RGCNEncoder(BaseEncoder):
         num_layers: int = 12,
         dropout: float = 0.1,
         num_node_types: int = 10,
-        num_edge_types: int = 7,
+        num_edge_types: int = 8,
         **kwargs,
     ):
         super().__init__(hidden_dim=hidden_dim)
