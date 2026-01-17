@@ -123,3 +123,74 @@ def collate_contrastive(batch: List[Dict]) -> Dict:
         'obfuscated': obfuscated,
         'simplified': simplified,
     }
+
+
+def collate_custom_format(batch: List[Dict]) -> Dict:
+    """
+    Collate function for CustomFormatDataset.
+
+    Compatible with custom text format datasets that have manually computed
+    fingerprints and AST graphs.
+
+    Args:
+        batch: List of dataset items from CustomFormatDataset
+
+    Returns:
+        Collated batch dictionary with:
+            - graph_batch: Batched PyG Data
+            - fingerprint: [batch_size, FINGERPRINT_DIM]
+            - obfuscated_tokens: [batch_size, max_obf_len] (padded)
+            - obfuscated_lengths: [batch_size]
+            - simplified_tokens: [batch_size, max_simp_len] (padded)
+            - simplified_lengths: [batch_size]
+            - depth: [batch_size]
+            - obfuscated: List[str]
+            - simplified: List[str]
+            - section: List[str]
+            - additional: List[str or None] (optional third column)
+    """
+    # Extract components
+    graphs = [item['graph_data'] for item in batch]
+    fingerprints = [item['fingerprint'] for item in batch]
+    obfuscated_tokens = [item['obfuscated_tokens'] for item in batch]
+    simplified_tokens = [item['simplified_tokens'] for item in batch]
+    depths = [item['depth'] for item in batch]
+    obfuscated = [item['obfuscated'] for item in batch]
+    simplified = [item['simplified'] for item in batch]
+    sections = [item['section'] for item in batch]
+    additional = [item['additional'] for item in batch]
+
+    # Batch graphs using PyG
+    graph_batch = Batch.from_data_list(graphs)
+
+    # Stack fingerprints
+    fingerprint_tensor = torch.stack(fingerprints, dim=0)
+
+    # Pad obfuscated token sequences
+    obfuscated_lengths = torch.tensor([len(seq) for seq in obfuscated_tokens], dtype=torch.long)
+    obfuscated_padded = pad_sequence(
+        obfuscated_tokens, batch_first=True, padding_value=PAD_IDX
+    )
+
+    # Pad simplified token sequences
+    simplified_lengths = torch.tensor([len(seq) for seq in simplified_tokens], dtype=torch.long)
+    simplified_padded = pad_sequence(
+        simplified_tokens, batch_first=True, padding_value=PAD_IDX
+    )
+
+    # Depths
+    depth_tensor = torch.tensor(depths, dtype=torch.long)
+
+    return {
+        'graph_batch': graph_batch,
+        'fingerprint': fingerprint_tensor,
+        'obfuscated_tokens': obfuscated_padded,
+        'obfuscated_lengths': obfuscated_lengths,
+        'simplified_tokens': simplified_padded,
+        'simplified_lengths': simplified_lengths,
+        'depth': depth_tensor,
+        'obfuscated': obfuscated,
+        'simplified': simplified,
+        'section': sections,
+        'additional': additional,
+    }

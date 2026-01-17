@@ -4,7 +4,8 @@ from src.data.ast_parser import ASTNode, parse_to_ast, ast_to_graph, expr_to_gra
 from src.data.tokenizer import MBATokenizer
 from src.data.fingerprint import SemanticFingerprint
 from src.data.dataset import MBADataset, ContrastiveDataset
-from src.data.collate import collate_graphs, collate_contrastive
+from src.data.custom_format_dataset import CustomFormatDataset
+from src.data.collate import collate_graphs, collate_contrastive, collate_custom_format
 
 __all__ = [
     'ASTNode',
@@ -17,6 +18,8 @@ __all__ = [
     'SemanticFingerprint',
     'MBADataset',
     'ContrastiveDataset',
+    'CustomFormatDataset',
     'collate_graphs',
     'collate_contrastive',
+    'collate_custom_format',
 ]
