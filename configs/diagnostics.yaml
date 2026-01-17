@@ -1,0 +1,52 @@
+# Diagnostic Tools Configuration
+# Usage: python scripts/train.py --diagnostics configs/diagnostics.yaml
+
+# Enable/disable individual diagnostics
+activation_monitor:
+  enabled: true
+  track_gradients: true
+  vanishing_threshold: 1.0e-4  # Gradient norm below this = vanishing
+  exploding_threshold: 100.0    # Gradient norm above this = exploding
+  dead_neuron_threshold: 1.0e-6
+
+collapse_detector:
+  enabled: true
+  sample_size: 500  # MANDATORY for memory budgeting
+  max_nodes_for_full_distance: 5000  # Skip O(N²) if total nodes exceed this
+  chunk_size: 500  # Chunk size for distance computation
+  similarity_threshold: 0.95  # Inter-layer similarity above this = collapse
+  diversity_threshold: 0.1    # Diversity below this = collapse
+
+attention_analyzer:
+  enabled: false  # Disabled by default (requires MultiheadAttention with need_weights=True)
+  max_seq_length_to_store: 128  # Skip attention for sequences longer than this
+  module_types:  # Attention module types to hook
+    - MultiheadAttention
+    - HGTConv
+
+diversity_metrics:
+  enabled: true
+  sample_size: 500  # MANDATORY for memory budgeting
+  max_nodes_for_full_distance: 5000
+  chunk_size: 500
+  distance_threshold: 0.5   # Mean distance below this = squashing
+  variance_threshold: 0.01  # Dimension variance below this = squashing
+
+# Logging configuration
+logging:
+  log_interval: 100  # Steps between diagnostic logging
+  save_plots: true   # Save diagnostic plots
+  plot_interval: 500  # Steps between plot generation
+  plot_dir: "diagnostics_plots"
+
+# TensorBoard integration
+tensorboard:
+  enabled: true
+  log_dir: "logs/diagnostics"
+
+# Visualization settings
+visualization:
+  generate_on_finish: true  # Generate final plots at end of training
+  output_formats:  # Output formats for plots
+    - png
+    - pdf

@@ -335,6 +335,199 @@ class BaseTrainer(ABC):
         if self.tensorboard_writer is not None:
             self.tensorboard_writer.close()
 
+        # Clean up diagnostics if active
+        self.cleanup_diagnostics()
+
+    # ========== Diagnostic Integration ==========
+
+    def enable_activation_monitor(self, track_gradients: bool = True) -> None:
+        """
+        Enable activation monitoring diagnostics.
+
+        Args:
+            track_gradients: Whether to track gradient norms
+        """
+        try:
+            from src.diagnostics import ActivationMonitor
+
+            self.activation_monitor = ActivationMonitor(track_gradients=track_gradients)
+            self.activation_monitor.register_hooks(self.model)
+            logger.info("Activation monitor enabled")
+        except ImportError as e:
+            logger.warning(f"Cannot enable activation monitor: {e}")
+
+    def enable_collapse_detector(
+        self,
+        sample_size: int = 500,
+        max_nodes_for_full_distance: int = 5000,
+    ) -> None:
+        """
+        Enable representation collapse detection.
+
+        Args:
+            sample_size: Number of nodes to sample for diversity computation
+            max_nodes_for_full_distance: Memory budget for O(N²) operations
+        """
+        try:
+            from src.diagnostics import CollapseDetector
+
+            self.collapse_detector = CollapseDetector(
+                sample_size=sample_size,
+                max_nodes_for_full_distance=max_nodes_for_full_distance,
+            )
+            self.collapse_detector.register_hooks(self.model)
+            logger.info("Collapse detector enabled")
+        except ImportError as e:
+            logger.warning(f"Cannot enable collapse detector: {e}")
+
+    def enable_attention_analyzer(self) -> None:
+        """Enable attention pattern analysis."""
+        try:
+            from src.diagnostics import AttentionAnalyzer
+
+            self.attention_analyzer = AttentionAnalyzer()
+            self.attention_analyzer.register_hooks(self.model)
+            logger.info("Attention analyzer enabled")
+        except ImportError as e:
+            logger.warning(f"Cannot enable attention analyzer: {e}")
+
+    def enable_diversity_metrics(
+        self,
+        sample_size: int = 500,
+        max_nodes_for_full_distance: int = 5000,
+    ) -> None:
+        """
+        Enable node embedding diversity metrics.
+
+        Args:
+            sample_size: Number of nodes to sample
+            max_nodes_for_full_distance: Memory budget for O(N²) operations
+        """
+        try:
+            from src.diagnostics import DiversityMetrics
+
+            self.diversity_metrics = DiversityMetrics(
+                sample_size=sample_size,
+                max_nodes_for_full_distance=max_nodes_for_full_distance,
+            )
+            self.diversity_metrics.register_hooks(self.model)
+            logger.info("Diversity metrics enabled")
+        except ImportError as e:
+            logger.warning(f"Cannot enable diversity metrics: {e}")
+
+    def cleanup_diagnostics(self) -> None:
+        """
+        Clean up all diagnostic hooks.
+
+        CRITICAL: Call this in finally block or use context manager pattern.
+        """
+        for attr in ['activation_monitor', 'collapse_detector', 'attention_analyzer', 'diversity_metrics']:
+            if hasattr(self, attr):
+                diagnostic = getattr(self, attr)
+                if hasattr(diagnostic, 'remove_hooks'):
+                    diagnostic.remove_hooks()
+
+    def log_diagnostics(self, log_interval: int = 100) -> None:
+        """
+        Log all active diagnostics to TensorBoard and console.
+
+        CRITICAL FIX: Refactored to avoid god function (was 71 lines, 4 nesting levels).
+        Now delegates to helper methods.
+
+        Args:
+            log_interval: Steps between diagnostic logging
+        """
+        if self.global_step % log_interval != 0:
+            return
+
+        # Log each diagnostic type
+        if hasattr(self, 'activation_monitor'):
+            self._log_single_diagnostic(
+                self.activation_monitor,
+                'diagnostics/activations',
+                'detect_pathologies',
+            )
+
+        if hasattr(self, 'collapse_detector'):
+            self._log_single_diagnostic(
+                self.collapse_detector,
+                'diagnostics/collapse',
+                'detect_collapse',
+            )
+
+        if hasattr(self, 'attention_analyzer'):
+            self._log_single_diagnostic(
+                self.attention_analyzer,
+                'diagnostics/attention',
+                None,  # No pathology detector
+            )
+
+        if hasattr(self, 'diversity_metrics'):
+            self._log_single_diagnostic(
+                self.diversity_metrics,
+                'diagnostics/diversity',
+                'detect_over_squashing',
+            )
+
+    def _log_single_diagnostic(
+        self,
+        collector,
+        prefix: str,
+        pathology_method: Optional[str],
+    ) -> None:
+        """
+        Helper: Log single diagnostic collector.
+
+        CRITICAL FIX: Extracted from log_diagnostics to reduce complexity.
+
+        Args:
+            collector: Diagnostic collector instance
+            prefix: TensorBoard prefix
+            pathology_method: Method name for pathology detection (if any)
+        """
+        # Log to TensorBoard
+        collector.log_to_tensorboard(self.tensorboard_writer, self.global_step, prefix)
+
+        # Detect and log pathologies
+        if pathology_method and hasattr(collector, pathology_method):
+            pathologies = getattr(collector, pathology_method)()
+            if any(pathologies.values()):
+                warning_msg = self._format_pathology_warning(pathologies, self.global_step)
+                logger.warning(warning_msg)
+
+        # Reset collector
+        collector.reset()
+
+    def _format_pathology_warning(
+        self,
+        pathologies: Dict[str, List[str]],
+        step: int,
+    ) -> str:
+        """
+        Helper: Format pathology warning message.
+
+        CRITICAL FIX: Extracted from log_diagnostics to reduce complexity.
+
+        Args:
+            pathologies: Dictionary of pathology types to layer names
+            step: Current training step
+
+        Returns:
+            Formatted warning message
+        """
+        lines = [f"Pathologies detected at step {step}:"]
+        for pathology_type, layers in pathologies.items():
+            if layers:
+                lines.append(f"  {pathology_type}: {len(layers)} layers")
+                for layer in layers[:3]:
+                    lines.append(f"    - {layer}")
+                if len(layers) > 3:
+                    lines.append(f"    ... and {len(layers) - 3} more")
+
+        return "\n".join(lines)
+
+    # ========== End Diagnostic Integration ==========
+
     @abstractmethod
     def train_step(self, batch: Any) -> Dict[str, float]:
         """
