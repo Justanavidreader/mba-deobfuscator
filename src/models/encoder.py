@@ -5,6 +5,7 @@ All encoder classes inherit from BaseEncoder for consistent interface
 in ablation studies. See encoder_base.py for interface specification.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,6 +23,9 @@ from src.constants import (
     GGNN_USE_PATH_ENCODING, HGT_USE_PATH_ENCODING,
     HGT_PATH_INJECTION_INTERVAL, HGT_PATH_INJECTION_SCALE,
     PATH_MAX_LENGTH, PATH_MAX_PATHS, PATH_AGGREGATION,
+    # GCNII over-smoothing mitigation
+    GCNII_ALPHA, GCNII_LAMBDA,
+    GCNII_USE_INITIAL_RESIDUAL, GCNII_USE_IDENTITY_MAPPING,
 )
 from src.models.encoder_base import BaseEncoder
 from src.models.global_attention import GlobalAttentionBlock
@@ -505,6 +509,11 @@ class HGTEncoder(BaseEncoder):
         path_aggregation: str = PATH_AGGREGATION,
         path_injection_interval: int = HGT_PATH_INJECTION_INTERVAL,
         path_injection_scale: float = HGT_PATH_INJECTION_SCALE,
+        # GCNII over-smoothing mitigation parameters
+        gcnii_alpha: float = GCNII_ALPHA,
+        gcnii_lambda: float = GCNII_LAMBDA,
+        use_initial_residual: bool = GCNII_USE_INITIAL_RESIDUAL,
+        use_identity_mapping: bool = GCNII_USE_IDENTITY_MAPPING,
         **kwargs,
     ):
         super().__init__(hidden_dim=hidden_dim)
@@ -526,6 +535,12 @@ class HGTEncoder(BaseEncoder):
         self.use_global_attention = use_global_attention
         self.global_attn_interval = global_attn_interval
         self.node_type_embed = nn.Embedding(num_node_types, hidden_dim)
+
+        # GCNII over-smoothing mitigation parameters
+        self.gcnii_alpha = gcnii_alpha
+        self.gcnii_lambda = gcnii_lambda
+        self.use_initial_residual = use_initial_residual
+        self.use_identity_mapping = use_identity_mapping
 
         # Use pruned metadata - only ~312 triplets instead of 700
         # HGTConv requires string type names for ModuleDict keys
@@ -792,6 +807,10 @@ class HGTEncoder(BaseEncoder):
         # Track original node types for final reconstruction
         original_node_types = x
 
+        # GCNII: Store initial embeddings for residual connection
+        # h^(0) = initial node embeddings (before any message passing)
+        h_0_dict = {ntype_str: h.clone() for ntype_str, h in x_dict.items()}
+
         # Compute path-based edge embeddings once (expensive, so not per-layer)
         path_edge_emb = None
         if self.use_path_encoding and self.path_encoder is not None:
@@ -802,12 +821,49 @@ class HGTEncoder(BaseEncoder):
         path_inject_idx = 0
 
         for layer_idx, (conv, norm) in enumerate(zip(self.convs, self.norms)):
+            # Compute beta for identity mapping (decreases with depth)
+            beta = self._compute_gcnii_beta(layer_idx, self.gcnii_lambda, self.use_identity_mapping)
+
             # Local HGT message passing
             x_dict_new = conv(x_dict, edge_index_dict)
+
             for ntype_str in x_dict:
-                if ntype_str in x_dict_new:
-                    x_dict[ntype_str] = norm(x_dict[ntype_str] + self.dropout(x_dict_new[ntype_str]))
-                    x_dict[ntype_str] = F.elu(x_dict[ntype_str])
+                if ntype_str not in x_dict_new:
+                    continue
+
+                # Current features
+                h_current = x_dict[ntype_str]
+
+                # Transformed features from HGT
+                h_transformed = x_dict_new[ntype_str]
+
+                # ============================================================
+                # TECHNIQUE 1: Identity Mapping
+                # Mix transformed features with identity (unchanged features)
+                # Deep layers have lower beta → act more like identity
+                # ============================================================
+                if self.use_identity_mapping:
+                    h_transformed = beta * h_transformed + (1 - beta) * h_current
+
+                # ============================================================
+                # TECHNIQUE 2: Standard Residual + LayerNorm
+                # ============================================================
+                h_residual = norm(h_current + self.dropout(h_transformed))
+
+                # ============================================================
+                # TECHNIQUE 3: GCNII-Style Initial Residual
+                # Mix current features with ORIGINAL input features
+                # Ensures h^(0) is always present in representation
+                # ============================================================
+                if self.use_initial_residual and ntype_str in h_0_dict:
+                    h_final = (
+                        self.gcnii_alpha * h_0_dict[ntype_str] +
+                        (1 - self.gcnii_alpha) * h_residual
+                    )
+                else:
+                    h_final = h_residual
+
+                x_dict[ntype_str] = F.elu(h_final)
 
             # Insert global attention after every N layers (except last layer)
             # Global attention needs flat format, so convert back and forth
@@ -890,6 +946,11 @@ class RGCNEncoder(BaseEncoder):
         num_edge_types: int = NUM_OPTIMIZED_EDGE_TYPES,
         # Edge type mode: RGCN only supports "optimized" (8-type)
         edge_type_mode: str = "optimized",
+        # GCNII over-smoothing mitigation parameters
+        gcnii_alpha: float = GCNII_ALPHA,
+        gcnii_lambda: float = GCNII_LAMBDA,
+        use_initial_residual: bool = GCNII_USE_INITIAL_RESIDUAL,
+        use_identity_mapping: bool = GCNII_USE_IDENTITY_MAPPING,
         **kwargs,
     ):
         super().__init__(hidden_dim=hidden_dim)
@@ -907,7 +968,14 @@ class RGCNEncoder(BaseEncoder):
 
         self.num_node_types = num_node_types
         self._num_edge_types = num_edge_types
+        self.num_layers = num_layers  # Add this if not present
         self.node_embed = nn.Embedding(num_node_types, hidden_dim)
+
+        # GCNII over-smoothing mitigation parameters
+        self.gcnii_alpha = gcnii_alpha
+        self.gcnii_lambda = gcnii_lambda
+        self.use_initial_residual = use_initial_residual
+        self.use_identity_mapping = use_identity_mapping
 
         self.convs = nn.ModuleList([
             pyg_nn.RGCNConv(hidden_dim, hidden_dim, num_relations=num_edge_types)
@@ -938,7 +1006,7 @@ class RGCNEncoder(BaseEncoder):
                       edge_type: Optional[torch.Tensor] = None,
                       dag_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Forward pass through RGCN layers.
+        Forward pass through RGCN layers with GCNII-style initial residuals and identity mapping.
 
         Args:
             x: [total_nodes] node type IDs (0-9)
@@ -952,11 +1020,42 @@ class RGCNEncoder(BaseEncoder):
         """
         # edge_type is validated by BaseEncoder.forward()
         # dag_pos integration deferred to encoder configuration (use_dag_features flag)
-        h = self.node_embed(x)
 
-        for conv, norm in zip(self.convs, self.layer_norms):
-            h_new = conv(h, edge_index, edge_type)
-            h = norm(h + self.dropout(F.elu(h_new)))
+        # Initial embedding h^(0)
+        h_0 = self.node_embed(x)
+        h = h_0
+
+        for layer_idx, (conv, norm) in enumerate(zip(self.convs, self.layer_norms)):
+            # Compute beta for identity mapping (decreases with depth)
+            beta = self._compute_gcnii_beta(layer_idx, self.gcnii_lambda, self.use_identity_mapping)
+
+            # RGCN transformation
+            h_transformed = conv(h, edge_index, edge_type)
+            h_transformed = F.elu(h_transformed)
+
+            # ============================================================
+            # TECHNIQUE 1: Identity Mapping
+            # Mix transformed features with identity (unchanged features)
+            # ============================================================
+            if self.use_identity_mapping:
+                h_transformed = beta * h_transformed + (1 - beta) * h
+
+            # ============================================================
+            # TECHNIQUE 2: Standard Residual + LayerNorm
+            # ============================================================
+            h_residual = norm(h + self.dropout(h_transformed))
+
+            # ============================================================
+            # TECHNIQUE 3: GCNII-Style Initial Residual
+            # Mix with ORIGINAL input features h^(0)
+            # ============================================================
+            if self.use_initial_residual:
+                h = (
+                    self.gcnii_alpha * h_0 +
+                    (1 - self.gcnii_alpha) * h_residual
+                )
+            else:
+                h = h_residual
 
         return h
 

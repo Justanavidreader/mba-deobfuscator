@@ -49,6 +49,11 @@ data:
   augment_prob: 0.8
   use_dag_features: true
 
+  # Dataset type: "scaled" for ScaledMBADataset (subexpression sharing)
+  dataset_type: scaled
+  share_subexpressions: true  # Enable subexpression sharing in graphs
+  max_seq_len: 2048  # Support very long sequences for depth-14
+
 logging:
   log_dir: logs/semantic_hgt
   checkpoint_dir: checkpoints/semantic_hgt

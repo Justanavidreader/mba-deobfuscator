@@ -49,6 +49,11 @@ data:
   val_path: data/val.jsonl
   max_depth: null  # No depth filter
 
+  # Dataset type: "scaled" for ScaledMBADataset (subexpression sharing)
+  dataset_type: scaled
+  share_subexpressions: true  # Enable subexpression sharing in graphs
+  max_seq_len: 256  # Support longer sequences
+
   # Negative sampling
   negative_sampler:
     z3_timeout_ms: 500  # Z3 verification timeout per pair

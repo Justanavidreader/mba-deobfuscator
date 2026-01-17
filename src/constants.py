@@ -97,11 +97,29 @@ VOCAB_SIZE: int = 300    # Padded for safety
 SYMBOLIC_DIM: int = 32        # Symbolic features
 CORNER_DIM: int = 256         # 4 widths x 64 corner cases
 RANDOM_DIM: int = 64          # 4 widths x 16 hash values
-DERIVATIVE_DIM: int = 32      # 4 widths x 8 derivative orders
+DERIVATIVE_DIM: int = 32      # 4 widths x 8 derivative orders (NOT USED - eval differences)
 TRUTH_TABLE_DIM: int = 64     # 2^6 entries for 6 variables
 
-FINGERPRINT_DIM: int = SYMBOLIC_DIM + CORNER_DIM + RANDOM_DIM + DERIVATIVE_DIM + TRUTH_TABLE_DIM
-assert FINGERPRINT_DIM == 448, f"Fingerprint dimension mismatch: {FINGERPRINT_DIM}"
+# Full fingerprint from C++ generator (448 dims)
+FINGERPRINT_DIM_FULL: int = SYMBOLIC_DIM + CORNER_DIM + RANDOM_DIM + DERIVATIVE_DIM + TRUTH_TABLE_DIM
+assert FINGERPRINT_DIM_FULL == 448, f"Full fingerprint dimension mismatch: {FINGERPRINT_DIM_FULL}"
+
+# ML fingerprint without derivatives (416 dims)
+# Derivatives excluded due to C++/Python evaluation method differences
+FINGERPRINT_DIM: int = SYMBOLIC_DIM + CORNER_DIM + RANDOM_DIM + TRUTH_TABLE_DIM
+assert FINGERPRINT_DIM == 416, f"ML fingerprint dimension mismatch: {FINGERPRINT_DIM}"
+
+# Fingerprint component offsets (full 448-dim layout)
+SYMBOLIC_START: int = 0
+SYMBOLIC_END: int = SYMBOLIC_START + SYMBOLIC_DIM  # 32
+CORNER_START: int = SYMBOLIC_END
+CORNER_END: int = CORNER_START + CORNER_DIM  # 288
+RANDOM_START: int = CORNER_END
+RANDOM_END: int = RANDOM_START + RANDOM_DIM  # 352
+DERIVATIVE_START: int = RANDOM_END
+DERIVATIVE_END: int = DERIVATIVE_START + DERIVATIVE_DIM  # 384
+TRUTH_TABLE_START: int = DERIVATIVE_END
+TRUTH_TABLE_END: int = TRUTH_TABLE_START + TRUTH_TABLE_DIM  # 448
 
 TRUTH_TABLE_VARS: int = 6     # Number of variables for truth table
 
@@ -157,6 +175,24 @@ DECODER_DROPOUT: float = 0.1
 # Output heads
 MAX_OUTPUT_LENGTH: int = 64   # For ComplexityHead
 MAX_OUTPUT_DEPTH: int = 16    # For ComplexityHead
+
+# =============================================================================
+# GCNII-STYLE OVER-SMOOTHING MITIGATION
+# =============================================================================
+
+# Initial residual connection strength (GCNII)
+# h^(l+1) = alpha * h^(0) + (1-alpha) * transformed
+# Recommended range: 0.1-0.2
+GCNII_ALPHA: float = 0.15
+
+# Identity mapping decay parameter (for beta calculation)
+# beta = log(lambda / (l+1) + 1)
+# Controls how much layers act like identity transformations
+GCNII_LAMBDA: float = 1.0
+
+# Feature flags to enable/disable GCNII techniques
+GCNII_USE_INITIAL_RESIDUAL: bool = True   # Enable GCNII initial residuals
+GCNII_USE_IDENTITY_MAPPING: bool = True   # Enable identity mapping in weights
 
 # =============================================================================
 # TRAINING HYPERPARAMETERS

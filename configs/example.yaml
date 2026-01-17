@@ -27,6 +27,11 @@ data:
   max_depth: 14
   num_samples: 1000000
 
+  # Dataset type: "scaled" for ScaledMBADataset (subexpression sharing)
+  dataset_type: scaled
+  share_subexpressions: true  # Enable subexpression sharing in graphs
+  max_seq_len: 256  # Support longer sequences
+
 wandb:
   enabled: true
   project: "mba-deobfuscator"

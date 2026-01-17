@@ -17,6 +17,7 @@ from src.models.full_model import MBADeobfuscator
 from src.data.tokenizer import MBATokenizer
 from src.data.ast_parser import expr_to_graph, expr_to_ast_depth
 from src.data.fingerprint import SemanticFingerprint
+from src.data.dataset import _strip_derivatives
 from src.inference.beam_search import BeamSearchDecoder
 from src.inference.htps import MinimalHTPS
 from src.inference.verify import ThreeTierVerifier, VerificationResult
@@ -201,7 +202,8 @@ class InferencePipeline:
         graph_batch = pyg_data.Batch.from_data_list([graph]).to(self.device)
 
         # CRITICAL FIX: Use SemanticFingerprint class
-        fingerprint_np = self.fingerprint_computer.compute(expr)
+        fingerprint_full = self.fingerprint_computer.compute(expr)
+        fingerprint_np = _strip_derivatives(fingerprint_full)
         fingerprint = torch.from_numpy(fingerprint_np).float().unsqueeze(0).to(self.device)
 
         # CRITICAL FIX: Use expr_to_ast_depth for depth

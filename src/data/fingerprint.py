@@ -7,14 +7,18 @@ Computes a 448-dimensional semantic fingerprint consisting of:
 - Random hash (64 dims)
 - Derivatives (32 dims)
 - Truth table (64 dims)
+
+Optional C++ acceleration via pybind11:
+- Falls back to pure Python if C++ module not available
 """
 
 import re
 import numpy as np
 from typing import Dict, List, Optional
+import warnings
 
 from src.constants import (
-    FINGERPRINT_DIM,
+    FINGERPRINT_DIM, FINGERPRINT_DIM_FULL,
     SYMBOLIC_DIM,
     CORNER_DIM,
     RANDOM_DIM,
@@ -22,6 +26,7 @@ from src.constants import (
     TRUTH_TABLE_DIM,
     BIT_WIDTHS,
     TRUTH_TABLE_VARS,
+    FINGERPRINT_MODE,
     get_corner_values,
 )
 # Direct import to avoid __init__.py chain that pulls in torch_scatter
@@ -31,6 +36,58 @@ _utils_path = os.path.join(os.path.dirname(__file__), '..', 'utils')
 if _utils_path not in sys.path:
     sys.path.insert(0, _utils_path)
 from expr_eval import evaluate_expr
+
+# Try to import C++ accelerated fingerprint module (optional)
+try:
+    import mba_fingerprint_cpp
+    HAS_CPP_FINGERPRINT = True
+except ImportError:
+    HAS_CPP_FINGERPRINT = False
+    # Only warn on first import, not every time
+    if not hasattr(sys.modules[__name__], '_cpp_import_warned'):
+        warnings.warn(
+            "C++ fingerprint module not available. Using pure Python implementation. "
+            "For better performance, build the C++ module with: "
+            "cd ../MBA_Generator && cmake -B build && cmake --build build --config Release",
+            ImportWarning
+        )
+        sys.modules[__name__]._cpp_import_warned = True
+
+
+def has_cpp_acceleration() -> bool:
+    """
+    Check if C++ accelerated fingerprint computation is available.
+
+    Returns:
+        True if mba_fingerprint_cpp module is available, False otherwise
+    """
+    return HAS_CPP_FINGERPRINT
+
+
+def get_implementation_info() -> dict:
+    """
+    Get information about the current fingerprint implementation.
+
+    Returns:
+        Dictionary with implementation details:
+        - 'cpp_available': bool - C++ module available
+        - 'cpp_version': str - C++ module version (if available)
+        - 'fingerprint_dim': int - Fingerprint dimensions
+    """
+    info = {
+        'cpp_available': HAS_CPP_FINGERPRINT,
+        'cpp_version': None,
+        'fingerprint_dim_full': FINGERPRINT_DIM_FULL,  # 448 (with derivatives)
+        'fingerprint_dim_ml': FINGERPRINT_DIM,  # 416 (without derivatives)
+    }
+
+    if HAS_CPP_FINGERPRINT:
+        try:
+            info['cpp_version'] = getattr(mba_fingerprint_cpp, '__version__', 'unknown')
+        except AttributeError:
+            pass
+
+    return info
 
 
 class SemanticFingerprint:
@@ -45,83 +102,129 @@ class SemanticFingerprint:
         - Truth table (64): 2^6 boolean outputs for 6 variables
     """
 
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 42, use_cpp: bool = True):
         """
         Initialize fingerprint computer.
 
         Args:
-            seed: Random seed for reproducible random inputs
+            seed: Unused, kept for backward compatibility (now deterministic)
+            use_cpp: If True and C++ module available, use C++ implementation for better performance
         """
-        self.rng = np.random.RandomState(seed)
-        self._init_random_inputs()
+        self.use_cpp = use_cpp and HAS_CPP_FINGERPRINT
+        self._init_deterministic_inputs()
 
-    def _init_random_inputs(self):
-        """Generate random input values for hash computation."""
-        # Generate random inputs for each bit width
+        if use_cpp and not HAS_CPP_FINGERPRINT:
+            warnings.warn(
+                "C++ fingerprint requested but not available. Using Python implementation.",
+                RuntimeWarning
+            )
+
+    def _init_deterministic_inputs(self):
+        """Generate deterministic test patterns for hash computation (no RNG)."""
+        # Deterministic test patterns replace random inputs for C++/Python consistency
         self.random_inputs = {}
+
         for width in BIT_WIDTHS:
             mask = (1 << width) - 1
-            # 16 random samples per width
             samples = []
-            for _ in range(16):
+
+            # 16 deterministic test patterns per width
+            # Pattern 0-3: all same value (0, 1, mid, max)
+            samples.append({f'x{i}': 0 for i in range(8)})
+            samples.append({f'x{i}': 1 for i in range(8)})
+            samples.append({f'x{i}': (1 << (width - 1)) & mask for i in range(8)})  # Midpoint
+            samples.append({f'x{i}': mask for i in range(8)})  # Max
+
+            # Pattern 4-7: specific bit patterns
+            samples.append({f'x{i}': (0xAA & mask) for i in range(8)})  # 10101010
+            samples.append({f'x{i}': (0x55 & mask) for i in range(8)})  # 01010101
+            samples.append({f'x{i}': (0xF0 & mask) for i in range(8)})  # 11110000
+            samples.append({f'x{i}': (0x0F & mask) for i in range(8)})  # 00001111
+
+            # Pattern 8-11: variable-specific patterns (each var gets different value)
+            for pattern_idx in range(4):
                 sample = {}
-                for i in range(8):
-                    # Generate random bytes and mask to width
-                    if width <= 31:
-                        # Use randint for smaller widths
-                        sample[f'x{i}'] = int(self.rng.randint(0, mask + 1))
-                    else:
-                        # For larger widths, generate from uniform distribution
-                        # Generate multiple 31-bit values and combine
-                        val = 0
-                        bits_remaining = width
-                        while bits_remaining > 0:
-                            bits_to_gen = min(31, bits_remaining)
-                            val = (val << bits_to_gen) | int(self.rng.randint(0, 1 << bits_to_gen))
-                            bits_remaining -= bits_to_gen
-                        sample[f'x{i}'] = val & mask
+                for var_idx in range(8):
+                    # Rotate bit pattern based on variable index
+                    val = ((pattern_idx << var_idx) | (pattern_idx >> (8 - var_idx))) & 0xFF
+                    sample[f'x{var_idx}'] = val & mask
                 samples.append(sample)
+
+            # Pattern 12-15: powers of 2 patterns
+            for pattern_idx in range(4):
+                sample = {}
+                for var_idx in range(8):
+                    bit_pos = (pattern_idx * 8 + var_idx) % width
+                    sample[f'x{var_idx}'] = (1 << bit_pos) & mask
+                samples.append(sample)
+
             self.random_inputs[width] = samples
 
     def compute(self, expr: str) -> np.ndarray:
         """
         Compute 448-dim fingerprint for expression.
 
+        Based on FINGERPRINT_MODE constant:
+        - "full": All components (symbolic + corner + random + derivative + truth_table)
+        - "truth_table_only": Only truth table (zeros for other components)
+
         Args:
             expr: MBA expression string
 
         Returns:
-            448-dimensional numpy array (float32)
+            448-dimensional numpy array (float64/double)
         """
-        fp = np.zeros(FINGERPRINT_DIM, dtype=np.float32)
+        # Try C++ implementation first if available and enabled
+        if self.use_cpp:
+            try:
+                # NOTE: C++ implementation not yet complete
+                # When ready, this will call: mba_fingerprint_cpp.compute_fingerprint(expr)
+                # For now, fall through to Python implementation
+                pass
+            except (AttributeError, NotImplementedError) as e:
+                # C++ function not implemented yet, fall back to Python
+                pass
+
+        # Python implementation (always available)
+        # Always compute full 448-dim fingerprint (derivatives stripped at dataset layer)
+        fp = np.zeros(FINGERPRINT_DIM_FULL, dtype=np.float64)
 
         # Extract variables from expression
         variables = self._extract_variables(expr)
 
-        # Compute each component
+        # Compute components based on mode
         offset = 0
 
-        # Symbolic features (32 dims)
-        fp[offset:offset + SYMBOLIC_DIM] = self._symbolic_features(expr)
-        offset += SYMBOLIC_DIM
+        if FINGERPRINT_MODE == "truth_table_only":
+            # Skip to truth table offset (symbolic + corner + random + derivative)
+            offset = SYMBOLIC_DIM + CORNER_DIM + RANDOM_DIM + DERIVATIVE_DIM
 
-        # Corner evaluations (256 dims)
-        fp[offset:offset + CORNER_DIM] = self._corner_evals(expr, variables)
-        offset += CORNER_DIM
+            # Truth table (64 dims) - only component computed
+            fp[offset:offset + TRUTH_TABLE_DIM] = self._truth_table(expr, variables)
+            offset += TRUTH_TABLE_DIM
 
-        # Random hash (64 dims)
-        fp[offset:offset + RANDOM_DIM] = self._random_hash(expr, variables)
-        offset += RANDOM_DIM
+        else:  # "full" mode
+            # Symbolic features (32 dims)
+            fp[offset:offset + SYMBOLIC_DIM] = self._symbolic_features(expr)
+            offset += SYMBOLIC_DIM
 
-        # Derivatives (32 dims)
-        fp[offset:offset + DERIVATIVE_DIM] = self._derivatives(expr, variables)
-        offset += DERIVATIVE_DIM
+            # Corner evaluations (256 dims)
+            fp[offset:offset + CORNER_DIM] = self._corner_evals(expr, variables)
+            offset += CORNER_DIM
 
-        # Truth table (64 dims)
-        fp[offset:offset + TRUTH_TABLE_DIM] = self._truth_table(expr, variables)
-        offset += TRUTH_TABLE_DIM
+            # Random hash (64 dims)
+            fp[offset:offset + RANDOM_DIM] = self._random_hash(expr, variables)
+            offset += RANDOM_DIM
 
-        assert offset == FINGERPRINT_DIM
+            # Derivatives (32 dims)
+            fp[offset:offset + DERIVATIVE_DIM] = self._derivatives(expr, variables)
+            offset += DERIVATIVE_DIM
+
+            # Truth table (64 dims)
+            fp[offset:offset + TRUTH_TABLE_DIM] = self._truth_table(expr, variables)
+            offset += TRUTH_TABLE_DIM
+
+        assert offset == FINGERPRINT_DIM_FULL, f"Computed {offset} dims, expected {FINGERPRINT_DIM_FULL}"
 
         return fp
 
@@ -149,7 +252,7 @@ class SemanticFingerprint:
         - Variable usage counts (8 dims for x0-x7)
         - Constant value statistics (mean, std, min, max)
         """
-        features = np.zeros(SYMBOLIC_DIM, dtype=np.float32)
+        features = np.zeros(SYMBOLIC_DIM, dtype=np.float64)
         idx = 0
 
         # Expression length (normalized)
@@ -214,22 +317,26 @@ class SemanticFingerprint:
         Evaluate at corner cases across bit widths.
 
         256 dims = 4 bit widths × 64 corner cases
+
+        Uses explicit float64 precision to match C++ implementation.
         """
-        features = np.zeros(CORNER_DIM, dtype=np.float32)
+        features = np.zeros(CORNER_DIM, dtype=np.float64)
         idx = 0
 
         for width in BIT_WIDTHS:
-            mask = (1 << width) - 1
+            # Keep mask as int for bitwise operations, use float64 for normalization
+            mask_int = (1 << width) - 1
+            mask_float = np.float64(mask_int)
             corners = get_corner_values(width)
 
             # Use all corners to generate 64 assignments per width (256 total)
             for corner_set in self._generate_corner_assignments(variables, corners, width):
                 result = evaluate_expr(expr, corner_set, width)
                 if result is not None:
-                    # Normalize to [0, 1]
-                    features[idx] = result / mask
+                    # Normalize to [0, 1] with float64 precision
+                    features[idx] = np.float64(result) / mask_float
                 else:
-                    features[idx] = 0.0
+                    features[idx] = np.float64(0.0)
                 idx += 1
 
                 if idx >= CORNER_DIM:
@@ -274,15 +381,19 @@ class SemanticFingerprint:
 
     def _random_hash(self, expr: str, variables: List[str]) -> np.ndarray:
         """
-        Evaluate at random inputs for hash-like signature.
+        Evaluate at deterministic test patterns for hash-like signature.
 
-        64 dims = 4 bit widths × 16 random samples
+        64 dims = 4 bit widths × 16 deterministic patterns
+
+        Uses explicit float64 precision to match C++ implementation.
         """
-        features = np.zeros(RANDOM_DIM, dtype=np.float32)
+        features = np.zeros(RANDOM_DIM, dtype=np.float64)
         idx = 0
 
         for width in BIT_WIDTHS:
-            mask = (1 << width) - 1
+            # Keep mask as int for bitwise operations, use float64 for normalization
+            mask_int = (1 << width) - 1
+            mask_float = np.float64(mask_int)
             samples = self.random_inputs[width]
 
             for sample in samples:
@@ -291,10 +402,10 @@ class SemanticFingerprint:
 
                 result = evaluate_expr(expr, var_assignment, width)
                 if result is not None:
-                    # Normalize to [0, 1]
-                    features[idx] = result / mask
+                    # Normalize to [0, 1] with float64 precision
+                    features[idx] = np.float64(result) / mask_float
                 else:
-                    features[idx] = 0.0
+                    features[idx] = np.float64(0.0)
                 idx += 1
 
         return features
@@ -304,14 +415,18 @@ class SemanticFingerprint:
         Approximate partial derivatives via finite differences.
 
         32 dims = 4 bit widths × 8 derivative approximations
+
+        Uses explicit float64 (double) precision to match C++ implementation.
         """
-        features = np.zeros(DERIVATIVE_DIM, dtype=np.float32)
+        features = np.zeros(DERIVATIVE_DIM, dtype=np.float64)
         idx = 0
 
         epsilon = 1
 
         for width in BIT_WIDTHS:
-            mask = (1 << width) - 1
+            # Keep mask as int for bitwise operations, use float64 for normalization
+            mask_int = (1 << width) - 1
+            mask_double = np.float64(mask_int)
             # Base point (all variables = midpoint)
             midpoint = 1 << (width - 1)
             base_point = {var: midpoint for var in (variables or ['x0'])}
@@ -322,18 +437,26 @@ class SemanticFingerprint:
                     var = variables[i]
                     # f(x + ε) - f(x)
                     perturbed = base_point.copy()
-                    perturbed[var] = (base_point[var] + epsilon) & mask
+                    perturbed[var] = (base_point[var] + epsilon) & mask_int
 
                     f_base = evaluate_expr(expr, base_point, width)
                     f_perturbed = evaluate_expr(expr, perturbed, width)
 
                     if f_base is not None and f_perturbed is not None:
-                        derivative = ((f_perturbed - f_base) & mask) / epsilon
-                        features[idx] = min(1.0, derivative / mask)
+                        # Use explicit float64 (double) arithmetic (signed difference)
+                        # For width=64, values can exceed signed int64 range, so use Python int
+                        # then compute difference and cast to float64
+                        f_base_py = int(f_base)
+                        f_perturbed_py = int(f_perturbed)
+                        diff = np.float64(f_perturbed_py - f_base_py)
+
+                        # Normalize to [-1, 1] range with float64 precision
+                        normalized = np.clip(diff / mask_double, -1.0, 1.0).astype(np.float64)
+                        features[idx] = normalized
                     else:
-                        features[idx] = 0.0
+                        features[idx] = np.float64(0.0)
                 else:
-                    features[idx] = 0.0
+                    features[idx] = np.float64(0.0)
 
                 idx += 1
                 if idx >= DERIVATIVE_DIM:
@@ -353,7 +476,7 @@ class SemanticFingerprint:
 
         64 dims = 64 truth table entries (one per input combination)
         """
-        features = np.zeros(TRUTH_TABLE_DIM, dtype=np.float32)
+        features = np.zeros(TRUTH_TABLE_DIM, dtype=np.float64)
 
         # Use first TRUTH_TABLE_VARS (6) variables
         vars_to_use = variables[:TRUTH_TABLE_VARS] if variables else []

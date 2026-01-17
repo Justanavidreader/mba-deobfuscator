@@ -49,13 +49,32 @@ def get_encoder(name: str, **kwargs) -> BaseEncoder:
 
     Args:
         name: Encoder name (key in registry)
-        **kwargs: Encoder-specific hyperparameters
+        **kwargs: Encoder-specific hyperparameters. Common parameters:
+            - hidden_dim (int): Hidden dimension (default: varies by encoder)
+            - num_layers (int): Number of layers (default: varies by encoder)
+            - dropout (float): Dropout rate (default: 0.1)
+
+            GCNII over-smoothing mitigation (HGT, RGCN, SemanticHGT):
+            - gcnii_alpha (float): Initial residual strength (default: 0.15)
+            - gcnii_lambda (float): Identity mapping decay rate (default: 1.0)
+            - use_initial_residual (bool): Enable GCNII residuals (default: True)
+            - use_identity_mapping (bool): Enable identity mapping (default: True)
 
     Returns:
         Instantiated encoder
 
     Raises:
         ValueError: If encoder name not registered
+
+    Examples:
+        # Standard encoder
+        encoder = get_encoder('hgt', hidden_dim=768, num_layers=12)
+
+        # Custom GCNII configuration for ablation
+        encoder = get_encoder('hgt', gcnii_alpha=0.2, use_initial_residual=False)
+
+        # Disable GCNII for baseline comparison
+        encoder = get_encoder('hgt', use_initial_residual=False, use_identity_mapping=False)
     """
     registry = _get_encoder_classes()
 

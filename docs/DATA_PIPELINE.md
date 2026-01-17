@@ -1,751 +1,1068 @@
-# Data Pipeline Architecture
+# Data Pipeline
 
-> **Purpose**: Convert raw MBA expression pairs into batched graph+fingerprint tensors for GNN+Transformer training.
-
-**Pipeline Flow**: JSONL → Dataset → Tokenize + Parse + Fingerprint → Collate → Batched Tensors
+Complete specification of data processing, tokenization, fingerprinting, and batching for the MBA Deobfuscator.
 
 ---
 
-## Data Flow Diagram
+## Pipeline Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│ Input: JSONL File                                                   │
-│ {"obfuscated": "(x&y)+(x^y)", "simplified": "x|y", "depth": 3}     │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ Dataset.__getitem__(idx)                                            │
-│   ├─ Load JSON line                                                 │
-│   ├─ Apply depth filter (curriculum learning)                       │
-│   └─ Split into 3 parallel paths:                                   │
-└─┬───────────────────────────┬─────────────────────────┬─────────────┘
-  │                           │                         │
-  ▼                           ▼                         ▼
-┌──────────────────┐  ┌───────────────────┐  ┌────────────────────┐
-│ AST Parser       │  │ Tokenizer         │  │ Fingerprint        │
-│                  │  │                   │  │                    │
-│ expr_to_graph()  │  │ encode()          │  │ compute()          │
-│                  │  │                   │  │                    │
-│ "x&y" →          │  │ "x|y" →           │  │ "x&y" →            │
-│   Graph:         │  │   [1,14,6,15,2]   │  │   [448 floats]     │
-│   x [HIDDEN]     │  │   <sos>,x,|,y,<eos>│  │   (5 components)   │
-│   ╱ ╲            │  │                   │  │                    │
-│  & VAR:y         │  │ get_source_tokens │  │ ├─ Symbolic (32)   │
-│  VAR:x           │  │   [14,5,15]       │  │ ├─ Corner (256)    │
-│                  │  │   x,&,y           │  │ ├─ Random (64)     │
-│ Returns:         │  │                   │  │ ├─ Derivative (32) │
-│   Data(          │  │ Returns:          │  │ └─ Truth (64)      │
-│     x: [N,32],   │  │   target_ids,     │  │                    │
-│     edge_index,  │  │   source_tokens   │  │ Returns:           │
-│     edge_type)   │  │                   │  │   np.array[448]    │
-└────────┬─────────┘  └─────────┬─────────┘  └─────────┬──────────┘
-         │                      │                       │
-         └──────────────┬───────┴───────────────────────┘
-                        ▼
-         ┌─────────────────────────────────────────┐
-         │ Dataset.__getitem__ Returns:            │
-         │  {                                      │
-         │    'graph': Data(...),                  │
-         │    'fingerprint': Tensor[448],          │
-         │    'target_ids': Tensor[seq_len],       │
-         │    'source_tokens': Tensor[src_len],    │
-         │    'depth': int,                        │
-         │    'obfuscated': str,                   │
-         │    'simplified': str                    │
-         │  }                                      │
-         └──────────────────┬──────────────────────┘
-                            │
-                (Multiple items batched by DataLoader)
-                            │
-                            ▼
-         ┌─────────────────────────────────────────┐
-         │ collate_graphs([item1, item2, ...])     │
-         │   ├─ Batch.from_data_list(graphs)       │
-         │   ├─ torch.stack(fingerprints)          │
-         │   ├─ pad_sequence(target_ids, pad=0)    │
-         │   └─ pad_sequence(source_tokens, pad=0) │
-         └──────────────────┬──────────────────────┘
-                            ▼
-         ┌─────────────────────────────────────────┐
-         │ Batched Output:                         │
-         │  {                                      │
-         │    'graph_batch': Data(                 │
-         │      x: [total_nodes, 32],              │
-         │      edge_index: [2, total_edges],      │
-         │      batch: [total_nodes]               │
-         │    ),                                   │
-         │    'fingerprint': [B, 448],             │
-         │    'target_ids': [B, max_len],          │
-         │    'target_lengths': [B],               │
-         │    'source_tokens': [B, max_src],       │
-         │    'source_lengths': [B],               │
-         │    'depth': [B]                         │
-         │  }                                      │
-         └─────────────────────────────────────────┘
-                            │
-                            ▼
-                   ┌──────────────┐
-                   │ Model.forward│
-                   └──────────────┘
+Raw Expression String
+    ↓
+[Normalization] C++ generator format → Internal format
+    ↓
+[AST Parser] String → Abstract Syntax Tree
+    ↓
+[Graph Builder] AST → PyTorch Geometric Data
+    ↓
+[Tokenizer] Expression → Token sequence
+    ↓
+[Fingerprint] Expression → 448-dim vector → 416-dim ML vector
+    ↓
+[Augmentation] Variable permutation (80% probability)
+    ↓
+[Collation] Individual samples → Batched Data
+    ↓
+Model Input: {graph, tokens, fingerprint}
 ```
 
 ---
 
-## 1. Expression Tokenization
+## 1. Data Format
 
-**File**: `src/data/tokenizer.py`
+### Input Format (JSONL)
 
-### Vocabulary Structure
-
-```
-Token ID Range  | Category        | Examples
-----------------|-----------------|---------------------------
-0-4             | Special         | <pad>, <sos>, <eos>, <unk>, <sep>
-5-11            | Operators       | +, -, *, &, |, ^, ~
-12-13           | Parentheses     | (, )
-14-21           | Variables       | x0-x7 (also x,y,z,a,b,c,d,e)
-22-277          | Constants       | 0-255
-278-299         | Reserved        | Future expansion
+```json
+{"obfuscated": "(x0 & x1) + (x0 ^ x1)", "simplified": "x0 | x1", "depth": 3}
+{"obfuscated": "x2 ^ x2", "simplified": "0", "depth": 1}
+{"obfuscated": "(x3 & ~x3) + x4", "simplified": "x4", "depth": 3}
 ```
 
-**Vocab Size**: 300 (padded for safety)
+**Fields**:
+- `obfuscated`: Obfuscated MBA expression (input)
+- `simplified`: Simplified equivalent (target)
+- `depth`: AST depth (for curriculum learning)
+
+**Variable naming**: `x0` to `x7` (8 variables max)
+
+### C++ Generator Format
+
+External C++ generator produces different format:
+```json
+{"input": "And(x, y) + Xor(x, y)", "output": "Or(x, y)", "complexity": 3}
+```
+
+**Normalization** (handled automatically):
+```python
+# src/data/dataset.py
+def _normalize_cpp_format(sample):
+    if 'input' in sample:
+        sample['obfuscated'] = sample.pop('input')
+    if 'output' in sample:
+        sample['simplified'] = sample.pop('output')
+    if 'complexity' in sample:
+        sample['depth'] = sample.pop('complexity')
+
+    # Function notation → operator notation
+    sample['obfuscated'] = sample['obfuscated'].replace('And', '&')
+    sample['obfuscated'] = sample['obfuscated'].replace('Or', '|')
+    # ... more replacements
+```
+
+---
+
+## 2. AST Parser
+
+Converts expression string to Abstract Syntax Tree and PyTorch Geometric graph.
+
+### Expression Grammar
+
+```bnf
+<expr>     ::= <term> | <expr> <binop> <term>
+<term>     ::= <factor> | <unaryop> <factor>
+<factor>   ::= <variable> | <constant> | "(" <expr> ")"
+<binop>    ::= "+" | "-" | "*" | "&" | "|" | "^"
+<unaryop>  ::= "~" | "-"
+<variable> ::= "x0" | "x1" | ... | "x7"
+<constant> ::= "0" | "1" | ... | "255"
+```
+
+### AST Node Types
+
+```python
+class NodeType(Enum):
+    VARIABLE = 0
+    CONSTANT = 1
+    ADD = 2
+    SUB = 3
+    MUL = 4
+    AND = 5
+    OR = 6
+    XOR = 7
+    NOT = 8
+    NEG = 9
+```
+
+### Example: `(x0 & x1) + (x0 ^ x1)`
+
+**AST**:
+```
+          ADD
+         /   \
+       AND    XOR
+       / \    / \
+      x0 x1  x0 x1
+```
+
+**Graph representation**:
+```python
+# Nodes
+nodes = [
+    {'type': ADD, 'id': 0},
+    {'type': AND, 'id': 1},
+    {'type': XOR, 'id': 2},
+    {'type': VARIABLE, 'var_id': 0, 'id': 3},  # x0 (left)
+    {'type': VARIABLE, 'var_id': 1, 'id': 4},  # x1
+    {'type': VARIABLE, 'var_id': 0, 'id': 5},  # x0 (right)
+    {'type': VARIABLE, 'var_id': 1, 'id': 6},  # x1
+]
+
+# Edges (8-type system)
+edges = [
+    (0, 1, LEFT_OPERAND),    # ADD → AND
+    (0, 2, RIGHT_OPERAND),   # ADD → XOR
+    (1, 3, LEFT_OPERAND),    # AND → x0
+    (1, 4, RIGHT_OPERAND),   # AND → x1
+    (2, 5, LEFT_OPERAND),    # XOR → x0
+    (2, 6, RIGHT_OPERAND),   # XOR → x1
+    # Inverse edges
+    (1, 0, LEFT_OPERAND_INV),
+    (2, 0, RIGHT_OPERAND_INV),
+    # ... more inverses
+]
+```
+
+### Edge Type Systems
+
+#### Legacy (6-type)
+
+Used by older datasets and GGNN:
+```python
+class EdgeType(Enum):
+    CHILD_LEFT = 0      # Parent → left child
+    CHILD_RIGHT = 1     # Parent → right child
+    PARENT = 2          # Child → parent
+    SIBLING_NEXT = 3    # Left sibling → right sibling
+    SIBLING_PREV = 4    # Right sibling → left sibling
+    SAME_VAR = 5        # Same variable occurrences
+```
+
+#### Optimized (8-type)
+
+Used by HGT, RGCN, Semantic HGT:
+```python
+class EdgeType(Enum):
+    LEFT_OPERAND = 0           # Operator → left operand
+    RIGHT_OPERAND = 1          # Operator → right operand
+    UNARY_OPERAND = 2          # Unary operator → operand
+
+    LEFT_OPERAND_INV = 3       # Left operand → operator
+    RIGHT_OPERAND_INV = 4      # Right operand → operator
+    UNARY_OPERAND_INV = 5      # Operand → unary operator
+
+    DOMAIN_BRIDGE_DOWN = 6     # Connect operator domains downward
+    DOMAIN_BRIDGE_UP = 7       # Connect operator domains upward
+```
+
+**Rationale**: Optimized system is more expressive for heterogeneous GNNs
+
+### Node Features
+
+```python
+# For each node
+node_features = {
+    'type': one_hot(node_type, num_classes=10),     # [10]
+    'var_id': one_hot(var_id, num_classes=8),       # [8] (if variable)
+    'const_val': normalized_value,                   # [1] (if constant)
+    'depth': node_depth / max_depth,                 # [1] (normalized)
+    'subtree_size': subtree_size / total_nodes,      # [1] (normalized)
+    'in_degree': in_degree,                          # [1]
+    'is_shared': is_shared_subexpression,            # [1] (boolean)
+}
+# Total: 23 dims per node
+```
+
+**DAG Features** (optional):
+- Depth: Distance from root
+- Subtree size: Number of descendants
+- In-degree: Number of parents (>1 if shared subexpression)
+- Is shared: Boolean flag for shared nodes
+
+### Implementation
+
+```python
+# src/data/ast_parser.py
+from src.data.ast_parser import parse_expression, expression_to_graph
+
+# Parse to AST
+ast = parse_expression("(x0 & x1) + (x0 ^ x1)")
+
+# Convert to PyG Data
+data = expression_to_graph(ast, edge_type_system='optimized')
+# data.x: [num_nodes × 23] node features
+# data.edge_index: [2 × num_edges] edge connectivity
+# data.edge_type: [num_edges] edge type labels
+# data.num_nodes: number of nodes
+```
+
+---
+
+## 3. Tokenization
+
+### Vocabulary (300 tokens)
+
+```python
+# Special tokens (0-4)
+PAD = 0
+UNK = 1
+BOS = 2  # Beginning of sequence
+EOS = 3  # End of sequence
+MASK = 4  # For masked language modeling
+
+# Operators (5-12)
+AND = 5    # &
+OR = 6     # |
+XOR = 7    # ^
+ADD = 8    # +
+SUB = 9    # -
+MUL = 10   # *
+NOT = 11   # ~
+NEG = 12   # neg (unary minus)
+
+# Parentheses (13-14)
+LPAREN = 13  # (
+RPAREN = 14  # )
+
+# Variables (15-22)
+X0 = 15, X1 = 16, ..., X7 = 22
+
+# Constants (23-277)
+# 0 → 255 mapped to tokens 23-277
+
+# Reserved (278-299)
+# For future expansion
+```
 
 ### Tokenization Process
 
 ```python
-# Input:  "(x & y) + 1"
-# Step 1: Normalize whitespace → "(x & y) + 1"
-# Step 2: Add spacing around ops → " ( x & y ) + 1 "
-# Step 3: Split and filter → ['(', 'x', '&', 'y', ')', '+', '1']
-# Step 4: Map to IDs → [12, 14, 5, 15, 13, 5, 22]
-# Step 5: Add special → [1, 12, 14, 5, 15, 13, 5, 22, 2]  # <sos>, ..., <eos>
+from src.data.tokenizer import MBATokenizer
+
+tokenizer = MBATokenizer()
+
+# Encode
+expression = "(x0 & x1) + (x0 ^ x1)"
+tokens = tokenizer.encode(expression)
+# tokens = [13, 15, 5, 16, 14, 8, 13, 15, 7, 16, 14]
+#           (   x0  &  x1  )   +  (   x0  ^  x1  )
+
+# Decode
+decoded = tokenizer.decode(tokens)
+# decoded = "(x0 & x1) + (x0 ^ x1)"
+
+# With special tokens
+tokens_with_special = tokenizer.encode(expression, add_special_tokens=True)
+# tokens_with_special = [2, 13, 15, 5, 16, 14, 8, 13, 15, 7, 16, 14, 3]
+#                        BOS (   x0  &  x1  )   +  (   x0  ^  x1  ) EOS
 ```
 
-### Key Methods
+### Tokenization Rules
 
-| Method              | Purpose                                   | Special Tokens |
-|---------------------|-------------------------------------------|----------------|
-| `tokenize(expr)`    | String → token list                       | No             |
-| `encode(expr)`      | String → token IDs                        | Yes (default)  |
-| `decode(ids)`       | Token IDs → string                        | Stripped       |
-| `get_source_tokens` | For copy mechanism (no SOS/EOS)           | No             |
+1. **Whitespace**: Ignored
+2. **Operators**: Multi-char operators (`<<`, `>>`) tokenized as single tokens (if needed)
+3. **Variables**: `x` followed by digit → variable token
+4. **Constants**: Decimal integers → constant tokens (0-255 supported)
+5. **Parentheses**: `(` and `)` → separate tokens
 
-**Unknown Token Handling**: Out-of-range constants (>255) and variables (x9+) map to `<unk>` (ID 3).
+### Variable Normalization
+
+Automatically renames variables to canonical order:
+```python
+# Input: (y & z) + (y ^ z)
+# Normalized: (x0 & x1) + (x0 ^ x1)
+
+# Variables sorted by first appearance: y→x0, z→x1
+```
+
+**Rationale**: Equivalent expressions with different variable names should have identical tokens
 
 ---
 
-## 2. AST Representation and Graph Construction
+## 4. Semantic Fingerprint
 
-**File**: `src/data/ast_parser.py`
+### Overview
 
-### AST Node Types
+**Purpose**: Capture semantic properties of expressions independent of syntactic form
 
+**Dimensions**: 448 (raw) → 416 (ML)
+
+**Deterministic**: Same expression always produces identical fingerprint
+
+**C++ Acceleration**: Optional 10× speedup via `mba_fingerprint_cpp`
+
+### Computation
+
+```python
+from src.data.fingerprint import SemanticFingerprint
+
+fp = SemanticFingerprint()
+vector = fp.compute("(x0 & x1) + (x0 ^ x1)")
+# vector.shape = (448,)
+
+# For ML (strip derivatives)
+ml_vector = fp.compute_ml("(x0 & x1) + (x0 ^ x1)")
+# ml_vector.shape = (416,)
 ```
-Node Type  | ID | Description           | Arity
------------|----|-----------------------|-------
-VAR        | 0  | Variable (x, y, ...)  | Leaf
-CONST      | 1  | Constant (0-255)      | Leaf
-ADD        | 2  | Addition (+)          | Binary
-SUB        | 3  | Subtraction (-)       | Binary
-MUL        | 4  | Multiplication (*)    | Binary
-AND        | 5  | Bitwise AND (&)       | Binary
-OR         | 6  | Bitwise OR (|)        | Binary
-XOR        | 7  | Bitwise XOR (^)       | Binary
-NOT        | 8  | Bitwise NOT (~)       | Unary
-NEG        | 9  | Negation (-)          | Unary
-```
-
-### Operator Precedence (High → Low)
-
-1. Variables, constants, parentheses
-2. `~` (NOT), unary `-` (NEG)
-3. `*` (MUL)
-4. `+`, `-` (ADD, SUB)
-5. `&` (AND)
-6. `^` (XOR)
-7. `|` (OR)
-
-### Parsing Algorithm
-
-**Recursive Descent Parser** with precedence climbing:
-
-```
-parse_expr → parse_or
-parse_or → parse_xor ('|' parse_xor)*
-parse_xor → parse_and ('^' parse_and)*
-parse_and → parse_additive ('&' parse_additive)*
-parse_additive → parse_multiplicative (('+' | '-') parse_multiplicative)*
-parse_multiplicative → parse_unary ('*' parse_unary)*
-parse_unary → ('~' | '-')? parse_primary
-parse_primary → '(' parse_expr ')' | VAR | CONST
-```
-
-### Graph Construction: Two Edge Systems
-
-#### Legacy System (6 types)
-
-Used by `ast_to_graph()` for base model:
-
-```
-Edge Type     | ID | Direction        | Example
---------------|----|--------------------|------------------
-CHILD_LEFT    | 0  | parent → left      | + → x (in x+y)
-CHILD_RIGHT   | 1  | parent → right     | + → y (in x+y)
-PARENT        | 2  | child → parent     | x → + (in x+y)
-SIBLING_NEXT  | 3  | left → right       | x → y (in x+y)
-SIBLING_PREV  | 4  | right → left       | y → x (in x+y)
-SAME_VAR      | 5  | var_use ↔ var_use  | x[node1] ↔ x[node2]
-```
-
-**Node Features**: `[num_nodes, 32]`
-- One-hot node type (10 dims)
-- Positional encoding: depth/20 (1 dim)
-- Variable index (8 dims for x0-x7)
-- Constant value normalized to [-1,1] (1 dim)
-- Padding (12 dims)
-
-#### Optimized System (8 types)
-
-Used by `ast_to_optimized_graph()` for scaled model with subexpression sharing:
-
-```
-Edge Type          | ID | Direction      | Semantic
--------------------|----|-----------------|-----------------------
-LEFT_OPERAND       | 0  | parent → left   | Forward dataflow
-RIGHT_OPERAND      | 1  | parent → right  | Forward dataflow
-UNARY_OPERAND      | 2  | parent → child  | Forward dataflow
-LEFT_OPERAND_INV   | 3  | left → parent   | Inverse (for GNN symmetry)
-RIGHT_OPERAND_INV  | 4  | right → parent  | Inverse (for GNN symmetry)
-UNARY_OPERAND_INV  | 5  | child → parent  | Inverse (for GNN symmetry)
-DOMAIN_BRIDGE_DOWN | 6  | bool → arith    | Cross-domain (parent to child)
-DOMAIN_BRIDGE_UP   | 7  | arith → bool    | Cross-domain (child to parent)
-```
-
-**Node Features**: `[num_nodes]` (just type IDs for heterogeneous GNN)
-
-**Domain Bridge Edges**: Added bidirectionally when domains differ between parent and child:
-- `DOMAIN_BRIDGE_DOWN`: When Boolean parent has Arithmetic child (e.g., `& → +`)
-- `DOMAIN_BRIDGE_UP`: When Arithmetic child has Boolean parent (e.g., `+ → &`)
-
-**Subexpression Sharing**: Implemented in `ScaledMBADataset._build_optimized_graph()` via subtree hashing (MD5). Identical subtrees merge to single node with shared incoming edges.
-
-### Example: AST for `(x & y) + (x ^ y)`
-
-```
-       +
-      / \
-     &   ^
-    / \ / \
-   x  y x  y
-```
-
-**Legacy Graph**:
-- Nodes: 7 (root +, &, ^, x1, y1, x2, y2)
-- Edges: 14 (6 CHILD, 6 PARENT, 2 SIBLING) + 4 SAME_VAR (x1↔x2, y1↔y2)
-
-**Optimized Graph with Subexpression Sharing**:
-- Nodes: 5 (root +, &, ^, x_shared, y_shared)
-- Edges: 10 (LEFT_OPERAND/RIGHT_OPERAND for each operator + inverses)
-- SAME_VAR edges eliminated (redundant with sharing)
-
----
-
-## 3. Semantic Fingerprint (448 Floats)
-
-**File**: `src/data/fingerprint.py`
 
 ### Component Breakdown
 
-```
-Component       | Dims | Offset | Purpose
-----------------|------|--------|------------------------------------------
-Symbolic        | 32   | 0      | Structural features (op counts, depth)
-Corner Evals    | 256  | 32     | Outputs at corner cases (4 widths × 64)
-Random Hash     | 64   | 288    | Outputs at random inputs (4 widths × 16)
-Derivatives     | 32   | 352    | Partial derivatives (4 widths × 8 vars)
-Truth Table     | 64   | 384    | LSB of outputs for 2^6 boolean inputs
-----------------|------|--------|------------------------------------------
-Total           | 448  |        |
-```
+#### 4.1 Symbolic Features (32 dims)
 
-### 3.1 Symbolic Features (32 dims)
-
-**Structural features extracted via pattern matching**:
-
+Structural analysis of AST:
 ```python
-features = [
-    len(expr) / 200.0,                    # [0] Normalized length
-    count('+') / 10.0,                    # [1] Addition count
-    count('-') / 10.0,                    # [2] Subtraction count
-    count('*') / 10.0,                    # [3] Multiplication count
-    count('&') / 10.0,                    # [4] AND count
-    count('|') / 10.0,                    # [5] OR count
-    count('^') / 10.0,                    # [6] XOR count
-    count('~') / 10.0,                    # [7] NOT count
-    num_variables / 8.0,                  # [8] Variable count
-    num_constants / 10.0,                 # [9] Constant count
-    max_paren_depth / 10.0,               # [10] Nesting level
-    (total_ops + max_paren_depth) / 20.0, # [11] Total complexity
-    # [12-19] Usage counts for x0-x7
-    count('x0')/5.0, ..., count('x7')/5.0,
-    # [20-23] Constant statistics
-    mean(constants)/256.0,
-    std(constants)/256.0,
-    min(constants)/256.0,
-    max(constants)/256.0,
-    # [24-31] Reserved/padding
+symbolic = [
+    num_nodes,              # Total AST nodes
+    num_leaves,             # Leaf count (vars + consts)
+    max_depth,              # Maximum depth
+    avg_depth,              # Average node depth
+    num_operators,          # Operator count
+    num_unique_vars,        # Unique variables
+    num_unique_consts,      # Unique constants
+
+    # Operator counts (per type)
+    count_add, count_sub, count_mul,
+    count_and, count_or, count_xor,
+    count_not, count_neg,
+
+    # Degree statistics
+    max_out_degree,
+    avg_out_degree,
+    max_in_degree,
+    avg_in_degree,
+
+    # Subtree statistics
+    max_subtree_size,
+    avg_subtree_size,
+
+    # Complexity metrics
+    cyclomatic_complexity,
+    expression_entropy,
+
+    # ... (padded to 32 dims)
 ]
 ```
 
-**Why Symbolic Features?**: Provides coarse structural signal for encoder initialization before learning semantic equivalence.
-
-### 3.2 Corner Evaluations (256 dims)
-
-**Evaluation at edge cases across 4 bit widths**: 8, 16, 32, 64
-
+**Example**: `(x0 & x1) + (x0 ^ x1)`
 ```python
-# For each width (e.g., 8-bit):
-corner_values = [
-    0, 1, 2, 3,                    # Small values
-    255, 254, 253,                 # Near max (for 8-bit)
-    128, 127, 129,                 # Around midpoint
-    0xAA, 0x55,                    # Alternating bits
-    *[2**i for i in range(8)],     # Powers of 2
-    *[(2**i)-1 for i in range(8)], # Powers of 2 minus 1
-]
-
-# Generate 64 variable assignments per width using corners
-# Total: 4 widths × 64 assignments = 256 evaluations
-```
-
-**Assignment Strategy**: Cycle through corner values for each variable using `(i + j*7) % len(corners)` pattern for diverse combinations.
-
-**Normalization**: `output / max_value` for each width (e.g., `/255` for 8-bit).
-
-**Why Corner Cases?**: MBA expressions often differ at boundary conditions (0, max, powers of 2). Corner evals distinguish `x & y` from `x | y`.
-
-### 3.3 Random Hash (64 dims)
-
-**Pseudorandom evaluation for collision resistance**:
-
-```python
-# Seeded RNG (default seed=42) generates 16 random inputs per width
-# For each width: evaluate expression on 16 random variable assignments
-# Total: 4 widths × 16 samples = 64 evaluations
-
-# Example 8-bit random inputs (reproducible):
-random_inputs[8] = [
-    {'x0': 137, 'x1': 42, 'x2': 201, ...},  # Sample 1
-    {'x0': 73, 'x1': 189, 'x2': 15, ...},   # Sample 2
-    ...  # 16 total
+symbolic = [
+    7,    # num_nodes (ADD, AND, XOR, 4× variables)
+    4,    # num_leaves
+    3,    # max_depth
+    2.14, # avg_depth
+    3,    # num_operators (ADD, AND, XOR)
+    2,    # num_unique_vars (x0, x1)
+    0,    # num_unique_consts
+    1, 0, 0,  # 1× ADD, 0× SUB, 0× MUL
+    1, 0, 1,  # 1× AND, 0× OR, 1× XOR
+    0, 0,     # 0× NOT, 0× NEG
+    # ... more features
 ]
 ```
 
-**Why Random Hash?**: Acts as semantic fingerprint signature. Equivalent expressions produce identical hashes; different expressions unlikely to collide.
+#### 4.2 Corner Evaluations (256 dims)
 
-### 3.4 Derivatives (32 dims)
-
-**Finite difference approximation of partial derivatives**:
+Evaluate at extreme values across 4 bit widths:
 
 ```python
-# For each width and variable:
-base_point = {f'x{i}': 2^(width-1) for i in range(8)}  # Midpoint
-epsilon = 1
+bit_widths = [8, 16, 32, 64]
 
-# Partial derivative ∂f/∂x_i:
-derivative = (f(x0,...,x_i+ε,...,x7) - f(x0,...,x_i,...,x7)) / ε
+# Corner values per variable
+corner_cases = [
+    0, 1, -1,
+    MAX_VAL, MIN_VAL,
+    MAX_VAL // 2, MIN_VAL // 2,
+    # ... (64 total corner value combinations)
+]
 
-# Total: 4 widths × 8 variables = 32 derivatives
+corner_evals = []
+for width in bit_widths:
+    for values in corner_cases:
+        result = evaluate_expression(expr, values, width)
+        corner_evals.append(result % (2 ** width))
+
+# Total: 4 widths × 64 cases = 256 dims
 ```
 
-**Normalization**: `derivative / max_value` per width.
+**Example**: `x0 & x1` at width=8
+```python
+evaluate(x0=0, x1=0) = 0
+evaluate(x0=0, x1=1) = 0
+evaluate(x0=1, x1=0) = 0
+evaluate(x0=1, x1=1) = 1
+evaluate(x0=255, x1=255) = 255
+evaluate(x0=0, x1=255) = 0
+# ... all 64 corner cases
+```
 
-**Why Derivatives?**: Captures local behavior. Linear expressions have constant derivatives; nonlinear expressions vary.
+**Deterministic**: Fixed set of corner values ensures reproducibility
 
-### 3.5 Truth Table (64 dims)
+#### 4.3 Random Hash (64 dims)
 
-**Boolean output signature for first 6 variables**:
+Pseudo-random evaluations with fixed seed:
 
 ```python
-# Enumerate all 2^6 = 64 input combinations (6 variables as bits)
-for i in range(64):
-    assignment = {
-        'x0': (i >> 0) & 1,
-        'x1': (i >> 1) & 1,
-        'x2': (i >> 2) & 1,
-        'x3': (i >> 3) & 1,
-        'x4': (i >> 4) & 1,
-        'x5': (i >> 5) & 1,
-    }
-    output = evaluate(expr, assignment, width=64)
-    truth_table[i] = output & 1  # Extract LSB
+np.random.seed(42)  # Fixed for determinism
+random_inputs = np.random.randint(0, 2**32, size=(16, 8))  # 16 samples, 8 vars
+
+random_hash = []
+for width in [8, 16, 32, 64]:
+    for sample in random_inputs:
+        result = evaluate_expression(expr, sample[:num_vars], width)
+        random_hash.append(result % (2 ** width))
+
+# Total: 4 widths × 16 samples = 64 dims
 ```
 
-**Why Truth Table?**: Boolean expressions (AND/OR/XOR) differ in their truth tables. 64 entries fully characterize 6-variable boolean functions.
+**Purpose**: Probabilistic collision detection
+- Different expressions likely produce different hashes
+- Complements corner evaluations
 
-**Design Choice**: 2^6=64 fits exactly in 64 dims. Larger tables (2^8=256) would dominate fingerprint; smaller (2^4=16) lose expressiveness.
+#### 4.4 Derivatives (32 dims) - **EXCLUDED FOR ML**
+
+**Original computation** (not used):
+```python
+for width in [8, 16, 32, 64]:
+    for order in range(8):
+        derivative = compute_numerical_derivative(expr, order, width)
+        # derivative ≈ (f(x+h) - f(x)) / h for various h
+
+# Total: 4 widths × 8 orders = 32 dims
+```
+
+**Why excluded**:
+- C++ uses forward differences: `(f(x+1) - f(x)) / 1`
+- Python uses central differences: `(f(x+h) - f(x-h)) / (2h)`
+- Inconsistency causes fingerprint mismatches
+
+**Workaround**:
+```python
+# src/data/dataset.py
+def _strip_derivatives(fingerprint):
+    # Remove dims 352:384 (derivatives)
+    return np.concatenate([fingerprint[:352], fingerprint[384:]])
+
+# Called automatically in dataset __getitem__
+```
+
+#### 4.5 Truth Table (64 dims)
+
+Boolean function evaluation for up to 6 variables:
+
+```python
+num_vars = min(count_variables(expr), 6)
+
+truth_table = []
+for input_bits in range(64):  # 2^6 = 64
+    # Extract 6 bits
+    x0 = (input_bits >> 0) & 1
+    x1 = (input_bits >> 1) & 1
+    x2 = (input_bits >> 2) & 1
+    x3 = (input_bits >> 3) & 1
+    x4 = (input_bits >> 4) & 1
+    x5 = (input_bits >> 5) & 1
+
+    result = evaluate_expression(expr, [x0, x1, x2, x3, x4, x5])
+    truth_table.append(result & 1)  # Boolean output (0 or 1)
+
+# Total: 64 dims
+```
+
+**Example**: `x0 | x1`
+```python
+truth_table = [
+    0,  # x0=0, x1=0 → 0
+    1,  # x0=1, x1=0 → 1
+    1,  # x0=0, x1=1 → 1
+    1,  # x0=1, x1=1 → 1
+    # ... (60 more entries for x2-x5 combinations)
+]
+```
+
+**Properties**:
+- Complete Boolean function signature
+- Enables equivalence detection: `f ≡ g ⟺ truth_table(f) == truth_table(g)`
+- Sufficient for most MBA patterns
+
+### ML Fingerprint (416 dims)
+
+```python
+# Strip derivatives (dims 352:384)
+ml_fingerprint = np.concatenate([
+    fingerprint[:352],   # Symbolic + Corner + Random
+    fingerprint[384:]    # Truth table
+])
+
+assert ml_fingerprint.shape == (416,)
+```
+
+**Used throughout training and inference** to avoid C++/Python inconsistencies
+
+### C++ Acceleration
+
+```python
+try:
+    from mba_fingerprint_cpp import compute_fingerprint_cpp
+    USE_CPP = True
+except ImportError:
+    USE_CPP = False
+
+def compute(self, expr):
+    if USE_CPP:
+        return compute_fingerprint_cpp(expr)  # ~1-5ms
+    else:
+        return self._compute_python(expr)      # ~10-50ms
+```
+
+**Speedup**: 10× faster with C++ (optional dependency)
+
+**Fallback**: Gracefully falls back to pure Python if C++ library unavailable
 
 ---
 
-## 4. Batch Collation for Variable-Size Graphs
+## 5. Dataset Classes
 
-**File**: `src/data/collate.py`
+### 5.1 MBADataset (Phase 2 Supervised)
 
-### Challenge: Variable Sizes
+**Usage**: Supervised learning with curriculum
 
-- **Graphs**: Different node counts (depth 2: ~5 nodes, depth 14: ~300 nodes)
-- **Sequences**: Different token lengths (simplified "x+y": 5 tokens, obfuscated: 50+ tokens)
-
-### Solution: PyG Batching + Sequence Padding
-
-#### Graph Batching (`Batch.from_data_list`)
-
-PyTorch Geometric concatenates graphs along node dimension and adds `batch` tensor:
-
-```python
-# Input: 3 graphs with N1=4, N2=3, N3=5 nodes
-graph1.x.shape = [4, 32]
-graph2.x.shape = [3, 32]
-graph3.x.shape = [5, 32]
-
-# After Batch.from_data_list([graph1, graph2, graph3]):
-batched.x.shape = [12, 32]  # Concatenated nodes
-batched.edge_index.shape = [2, E_total]  # Edge indices offset per graph
-batched.batch = [0,0,0,0, 1,1,1, 2,2,2,2,2]  # Graph assignment per node
-```
-
-**Graph Pooling**: Use `scatter_mean(batched.x, batched.batch, dim=0)` to get per-graph embeddings.
-
-#### Sequence Padding
-
-```python
-# Input: 3 sequences with different lengths
-seq1 = [1, 14, 5, 15, 2]       # len=5
-seq2 = [1, 14, 6, 15, 2]       # len=5
-seq3 = [1, 12, 14, 5, 15, 13, 2]  # len=7
-
-# After pad_sequence([seq1, seq2, seq3], padding_value=0):
-padded = [
-    [1, 14, 5, 15, 2, 0, 0],   # Padded with 0 (<pad>)
-    [1, 14, 6, 15, 2, 0, 0],
-    [1, 12, 14, 5, 15, 13, 2],
-]
-padded.shape = [3, 7]  # [batch_size, max_len]
-lengths = [5, 5, 7]
-```
-
-**Padding Token**: `PAD_IDX=0` (`<pad>` token).
-
-**Length Tracking**: `target_lengths` and `source_lengths` tensors enable masking in loss computation.
-
-### Collate Functions
-
-#### `collate_graphs(batch)` - Supervised Training
-
-**Input**: List of `MBADataset.__getitem__` outputs
-**Output**:
-```python
-{
-    'graph_batch': Data(x=[N_total, 32], edge_index=[2, E_total], batch=[N_total]),
-    'fingerprint': Tensor[batch_size, 448],
-    'target_ids': Tensor[batch_size, max_target_len],  # Padded with PAD_IDX
-    'target_lengths': Tensor[batch_size],
-    'source_tokens': Tensor[batch_size, max_source_len],  # For copy mechanism
-    'source_lengths': Tensor[batch_size],
-    'depth': Tensor[batch_size],
-    'obfuscated': List[str],  # For debugging/logging
-    'simplified': List[str],
-}
-```
-
-#### `collate_contrastive(batch)` - Phase 1 Pretraining
-
-**Input**: List of `ContrastiveDataset.__getitem__` outputs
-**Output**:
-```python
-{
-    'obf_graph_batch': Data(...),     # Obfuscated expression graphs
-    'simp_graph_batch': Data(...),    # Simplified expression graphs
-    'obf_fingerprint': Tensor[batch_size, 448],
-    'simp_fingerprint': Tensor[batch_size, 448],
-    'labels': Tensor[batch_size],     # Index for positive pair matching in InfoNCE
-    'obfuscated': List[str],
-    'simplified': List[str],
-}
-```
-
-**InfoNCE Loss**: Uses `labels` to identify positive pairs. Label `i` means `obf_graph[i]` and `simp_graph[i]` are equivalent.
-
----
-
-## 5. Data Formats
-
-### Input Format (JSONL)
-
-**Base Schema** (for `MBADataset` and `ContrastiveDataset`):
-```json
-{"obfuscated": "(x & y) + (x ^ y)", "simplified": "x | y", "depth": 3}
-{"obfuscated": "(x + y) ^ (x | y)", "simplified": "x & y", "depth": 3}
-```
-
-**Fields**:
-- `obfuscated` (str, required): Input MBA expression
-- `simplified` (str, required): Target simplified expression
-- `depth` (int, optional): AST depth for curriculum learning
-
-**Scaled Schema v6** (for `ScaledMBADataset`):
-```json
-{
-  "obfuscated_expr": "(x & y) + (x ^ y)",
-  "ground_truth_expr": "x | y",
-  "depth": 3,
-  "boolean_domain_only": false,
-  "complexity_score": 0.42,
-  "ast": {
-    "nodes": [
-      {"id": 0, "type": "ADD"},
-      {"id": 1, "type": "AND"},
-      {"id": 2, "type": "VAR", "value": "x"},
-      ...
-    ],
-    "edges": [
-      {"src": 0, "dst": 1, "type": 0},  // CHILD_LEFT
-      ...
-    ]
-  },
-  "fingerprint": {
-    "flat": [0.12, 0.45, ..., 0.89]  // 448 floats
-  }
-}
-```
-
-**Additional Fields**:
-- `boolean_domain_only` (bool): Conditioning signal for domain-specific rules
-- `complexity_score` (float): Pre-computed complexity metric
-- `ast` (dict): Pre-built AST (nodes + edges) for subexpression sharing
-- `fingerprint.flat` (list): Pre-computed 448-dim fingerprint
-
-**Backward Compatibility**: `ScaledMBADataset` supports both old (`obfuscated`/`simplified`) and new (`obfuscated_expr`/`ground_truth_expr`) field names.
-
-### Output Format (Model Predictions)
-
-**Beam Search Output**:
-```json
-{
-  "input": "(x & y) + (x ^ y)",
-  "candidates": [
-    {
-      "expression": "x | y",
-      "score": 12.34,
-      "log_prob": -2.1,
-      "verified": true,
-      "verification_method": "z3",
-      "simplification_gain": 0.67
-    },
-    {
-      "expression": "x + y - (x & y)",
-      "score": 11.89,
-      "log_prob": -2.3,
-      "verified": true,
-      "verification_method": "execution",
-      "simplification_gain": 0.12
-    }
-  ],
-  "best": "x | y"
-}
-```
-
-**Verification Methods**:
-- `syntax`: Parses successfully
-- `execution`: Passes random execution tests
-- `z3`: Z3 proves equivalence
-
----
-
-## 6. Dataset Classes
-
-### `MBADataset` - Supervised Seq2Seq Training
-
-**Purpose**: Phase 2 supervised training with cross-entropy loss.
-
-**Key Features**:
-- Depth filtering for curriculum learning
-- Both source and target tokenization (for copy mechanism)
-- Fallback to runtime fingerprint computation
-
-**Usage**:
 ```python
 from src.data.dataset import MBADataset
-from src.data.tokenizer import MBATokenizer
-from src.data.fingerprint import SemanticFingerprint
-from src.data.collate import collate_graphs
-from torch.utils.data import DataLoader
-
-tokenizer = MBATokenizer()
-fingerprint = SemanticFingerprint(seed=42)
 
 dataset = MBADataset(
-    data_path="data/train_depth_5.jsonl",
-    tokenizer=tokenizer,
-    fingerprint=fingerprint,
-    max_depth=5  # Curriculum stage 2
+    data_path='data/train.json',
+    max_depth=10,  # Curriculum stage
+    augment=True   # Variable permutation
 )
+
+sample = dataset[0]
+# sample = {
+#     'obfuscated_graph': Data(...),
+#     'obfuscated_tokens': Tensor([...]),
+#     'simplified_tokens': Tensor([...]),
+#     'fingerprint': Tensor([416]),
+#     'depth': int,
+#     'length': int
+# }
+```
+
+**Features**:
+- Filters by max depth (curriculum learning)
+- Strips derivatives from fingerprint
+- Variable augmentation (80% probability)
+- Normalizes C++ generator format
+
+### 5.2 ContrastiveDataset (Phase 1 Pretraining)
+
+**Usage**: Contrastive learning with positive pairs
+
+```python
+from src.data.dataset import ContrastiveDataset
+
+dataset = ContrastiveDataset(
+    data_path='data/train.json',
+    augment=True
+)
+
+sample = dataset[0]
+# sample = {
+#     'anchor': Data(...),           # Original expression graph
+#     'positive': Data(...),         # Equivalent expression graph
+#     'fingerprint': Tensor([416])
+# }
+```
+
+**Positive pairs**:
+- Original and simplified expressions (guaranteed equivalent)
+- Variable-permuted versions of same expression
+
+**Loss**: InfoNCE (maximize similarity of positive pairs)
+
+### 5.3 ScaledMBADataset (360M Model)
+
+**Usage**: Scaled model with subexpression sharing
+
+```python
+from src.data.dataset import ScaledMBADataset
+
+dataset = ScaledMBADataset(
+    data_path='data/train_large.json',
+    max_seq_len=2048,  # Support depth-14 expressions
+    share_subexpressions=True
+)
+```
+
+**Features**:
+- Supports very long sequences (up to 2048 tokens)
+- Detects and shares common subexpressions in graph
+- Uses 8-type edge system (required for HGT)
+- Larger batch fingerprint caching
+
+### 5.4 GMNDataset (Graph Matching)
+
+**Usage**: Graph Matching Network training
+
+```python
+from src.data.dataset import GMNDataset
+
+dataset = GMNDataset(
+    data_path='data/train.json',
+    pair_mode='equivalent'  # or 'random'
+)
+
+sample = dataset[0]
+# sample = {
+#     'graph1': Data(...),
+#     'graph2': Data(...),
+#     'label': 1,  # 1 = equivalent, 0 = different
+#     'fingerprint1': Tensor([416]),
+#     'fingerprint2': Tensor([416])
+# }
+```
+
+**Pair modes**:
+- `equivalent`: Positive pairs (obfuscated + simplified)
+- `random`: Random pairs with labels (for contrastive training)
+
+---
+
+## 6. Data Augmentation
+
+### Variable Permutation
+
+**Goal**: Increase training data diversity, enforce variable-order invariance
+
+**Method**:
+```python
+# Original: (x0 & x1) + (x0 ^ x1)
+# Permuted: (x1 & x2) + (x1 ^ x2)  (swap x0↔x1, shift all)
+
+def augment_variables(expr, prob=0.8):
+    if random.random() > prob:
+        return expr  # No augmentation
+
+    # Extract unique variables
+    vars = extract_variables(expr)  # ['x0', 'x1']
+
+    # Generate random permutation
+    new_vars = random.sample(vars, len(vars))  # ['x1', 'x0']
+
+    # Rename
+    for old, new in zip(vars, new_vars):
+        expr = expr.replace(old, f'__{new}__')  # Temp names to avoid conflicts
+
+    expr = expr.replace('__', '')  # Remove temp markers
+
+    return expr
+```
+
+**Applied**:
+- 80% probability during training
+- Disabled during validation/testing
+- Increases dataset size ~5× effectively
+
+**Example**:
+```python
+# Original
+obf = "(x0 & x1) + (x0 ^ x1)"
+sim = "x0 | x1"
+
+# Augmented
+obf_aug = "(x1 & x0) + (x1 ^ x0)"  # Variable swap
+sim_aug = "x1 | x0"
+```
+
+---
+
+## 7. Batch Collation
+
+### Graph Batching
+
+PyTorch Geometric batches graphs by concatenating nodes and offset edge indices:
+
+```python
+# Individual graphs
+graph1: nodes=[5], edges=[4×2]
+graph2: nodes=[7], edges=[6×2]
+
+# Batched
+batch: nodes=[12], edges=[10×2]
+# graph1 nodes: 0-4
+# graph2 nodes: 5-11 (offset by 5)
+# graph1 edges: [...]
+# graph2 edges: [...] + 5 (indices offset)
+```
+
+**Implementation**:
+```python
+from src.data.collate import collate_mba_batch
+from torch.utils.data import DataLoader
 
 loader = DataLoader(
     dataset,
     batch_size=32,
-    shuffle=True,
-    collate_fn=collate_graphs,
-    num_workers=4
+    collate_fn=collate_mba_batch,
+    shuffle=True
+)
+
+batch = next(iter(loader))
+# batch = {
+#     'obfuscated_graph': Batch(...),  # PyG Batch
+#     'obfuscated_tokens': Tensor([32, max_len]),
+#     'simplified_tokens': Tensor([32, max_len]),
+#     'fingerprints': Tensor([32, 416]),
+#     'depths': Tensor([32]),
+#     'lengths': Tensor([32])
+# }
+```
+
+### Sequence Padding
+
+Token sequences padded to max length in batch:
+
+```python
+sequences = [
+    [2, 13, 15, 5, 16, 14, 3],           # length=7
+    [2, 15, 8, 16, 3],                   # length=5
+    [2, 13, 15, 7, 16, 14, 8, 22, 3]    # length=9
+]
+
+# Padded to max_len=9
+padded = [
+    [2, 13, 15, 5, 16, 14, 3, 0, 0],    # + 2 PAD
+    [2, 15, 8, 16, 3, 0, 0, 0, 0],      # + 4 PAD
+    [2, 13, 15, 7, 16, 14, 8, 22, 3]    # + 0 PAD
+]
+
+# Attention mask (1=real token, 0=padding)
+mask = [
+    [1, 1, 1, 1, 1, 1, 1, 0, 0],
+    [1, 1, 1, 1, 1, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1]
+]
+```
+
+**Used by decoder** to ignore padding during attention
+
+---
+
+## 8. Curriculum Learning
+
+### Depth-Based Curriculum (Phase 2)
+
+```python
+# Stage 1: Shallow expressions
+dataset_stage1 = MBADataset(data_path, max_depth=2)
+train(model, dataset_stage1, epochs=10)
+
+# Stage 2: Medium depth
+dataset_stage2 = MBADataset(data_path, max_depth=5)
+train(model, dataset_stage2, epochs=15)
+
+# Stage 3: Deep expressions
+dataset_stage3 = MBADataset(data_path, max_depth=10)
+train(model, dataset_stage3, epochs=15)
+
+# Stage 4: Very deep
+dataset_stage4 = MBADataset(data_path, max_depth=14)
+train(model, dataset_stage4, epochs=10)
+```
+
+**Rationale**: Gradually increase difficulty, prevent overfitting to complex patterns
+
+### Self-Paced Learning
+
+Dynamically adjust difficulty based on model performance:
+
+```python
+# After each epoch
+accuracy_by_depth = evaluate_per_depth(model, val_set)
+
+# If accuracy on depth-5 > 90%, include depth-6
+if accuracy_by_depth[5] > 0.9:
+    max_depth = 6
+```
+
+**Implementation**: `src/training/phase2_trainer.py`
+
+---
+
+## 9. Data Statistics
+
+### Dataset Sizes (Typical)
+
+| Split | Samples | Depth Range | Size (JSONL) |
+|-------|---------|-------------|--------------|
+| Train | 10M | 1-14 | ~2 GB |
+| Validation | 1M | 1-14 | ~200 MB |
+| Test | 100K | 1-14 | ~20 MB |
+
+### Expression Complexity Distribution
+
+| Depth | Avg Nodes | Avg Tokens | Percentage |
+|-------|-----------|------------|------------|
+| 1-2 | 3-5 | 5-7 | 15% |
+| 3-5 | 7-15 | 11-25 | 30% |
+| 6-10 | 20-50 | 30-80 | 40% |
+| 11-14 | 60-150 | 100-250 | 15% |
+
+### Memory Requirements
+
+| Component | Per Sample | Batch (32) | Dataset (10M) |
+|-----------|------------|------------|---------------|
+| Graph | ~1 KB | ~32 KB | ~10 GB |
+| Tokens | ~200 B | ~6 KB | ~2 GB |
+| Fingerprint | ~1.6 KB | ~50 KB | ~16 GB |
+| **Total** | ~3 KB | ~100 KB | ~30 GB |
+
+**Streaming**: Use `IterableDataset` for very large datasets (>10M samples)
+
+---
+
+## 10. Data Generation
+
+### Using Provided Script
+
+```bash
+python scripts/generate_data.py \
+    --depth 1-14 \
+    --samples 10000000 \
+    --output data/train.json \
+    --seed 42
+```
+
+**Parameters**:
+- `--depth`: Depth range (e.g., `1-14`, `3-10`)
+- `--samples`: Number of samples to generate
+- `--output`: Output JSONL file
+- `--seed`: Random seed for reproducibility
+
+### Manual Generation
+
+```python
+from src.data.generator import MBAGenerator
+
+gen = MBAGenerator(seed=42)
+
+# Generate single sample
+sample = gen.generate(max_depth=5)
+# sample = {
+#     'obfuscated': '(x0 & x1) + (x0 ^ x1)',
+#     'simplified': 'x0 | x1',
+#     'depth': 3
+# }
+
+# Generate dataset
+samples = gen.generate_dataset(num_samples=10000, max_depth=10)
+gen.save_jsonl(samples, 'data/train.json')
+```
+
+### MBA Identity Patterns
+
+Common obfuscation patterns:
+```python
+# Identity laws
+x & x → x
+x | x → x
+x ^ x → 0
+x + 0 → x
+
+# MBA patterns
+(x & y) + (x ^ y) → x | y
+(x | y) - (x ^ y) → x & y
+~(x & y) → ~x | ~y  (De Morgan)
+
+# Constant folding
+x & 0 → 0
+x | 0 → x
+x ^ 0 → x
+```
+
+**Generator** instantiates these patterns with random variables and depths
+
+---
+
+## 11. Performance Optimization
+
+### Fingerprint Caching
+
+```python
+# Cache fingerprints to avoid recomputation
+class MBADataset:
+    def __init__(self, data_path, cache_fingerprints=True):
+        self.fp_cache = {}
+
+    def __getitem__(self, idx):
+        expr = self.samples[idx]['obfuscated']
+
+        if expr in self.fp_cache:
+            fingerprint = self.fp_cache[expr]
+        else:
+            fingerprint = self.fingerprint_computer.compute_ml(expr)
+            self.fp_cache[expr] = fingerprint
+
+        return {'fingerprint': fingerprint, ...}
+```
+
+**Speedup**: ~10× for repeated expressions
+
+### Multiprocessing Data Loading
+
+```python
+loader = DataLoader(
+    dataset,
+    batch_size=32,
+    num_workers=4,      # Parallel data loading
+    pin_memory=True,    # Faster GPU transfer
+    prefetch_factor=2   # Prefetch 2 batches per worker
 )
 ```
 
-### `ContrastiveDataset` - Phase 1 Pretraining
+**Speedup**: ~4× with 4 workers (CPU-bound tasks)
 
-**Purpose**: Contrastive learning to map equivalent expressions to similar embeddings.
+### On-the-Fly Graph Construction
 
-**Key Features**:
-- Dual graph encoding (obfuscated + simplified)
-- Dual fingerprints
-- Labels for InfoNCE positive pair matching
+For very large datasets, construct graphs during `__getitem__`:
 
-**Loss Functions**:
-- **InfoNCE**: Pulls equivalent pairs together, pushes non-equivalent apart
-- **MaskLM**: Masked expression modeling (predict masked subexpressions)
-
-### `ScaledMBADataset` - Scaled Model with Optimizations
-
-**Purpose**: 360M parameter model training with efficiency optimizations.
-
-**Key Features**:
-- **Subexpression Sharing**: Merges identical subtrees via MD5 hashing
-- **Pre-computed Features**: Loads fingerprint from JSONL (avoids runtime computation)
-- **Optimized Edge Types**: 7-type system with inverses and domain bridges
-- **Conditioning Signals**: `boolean_domain_only` for domain-specific rule learning
-
-**Subexpression Sharing Algorithm**:
 ```python
-def _compute_subtree_hash(node_id):
-    """Bottom-up subtree hashing for deduplication."""
-    node = nodes[node_id]
-    children_hashes = [_compute_subtree_hash(child) for child in node.children]
-    subtree_str = f"{node.type}|{node.value}|{','.join(children_hashes)}"
-    return md5(subtree_str).hexdigest()
+def __getitem__(self, idx):
+    expr = self.samples[idx]['obfuscated']
 
-# During graph construction:
-if hash in seen_subtrees:
-    merge_node(current_node, seen_subtrees[hash])
-else:
-    seen_subtrees[hash] = current_node
+    # Don't precompute graphs (save memory)
+    graph = expression_to_graph(parse_expression(expr))
+
+    return {'graph': graph, ...}
 ```
 
-**Memory Reduction**: Depth 14 expressions with repeated subexpressions: 300 nodes → 150 nodes (50% reduction).
+**Trade-off**: Slower per-sample, but lower memory footprint
 
 ---
 
-## 7. Performance Characteristics
+## 12. Implementation Files
 
-### Throughput Benchmarks (A100 GPU)
-
-| Operation               | Time per Sample | Batch Size 32 | Bottleneck              |
-|-------------------------|-----------------|---------------|-------------------------|
-| Tokenization            | ~0.1 ms         | ~3 ms         | Regex matching          |
-| AST Parsing             | ~0.5 ms         | ~16 ms        | Recursive descent       |
-| Fingerprint Compute     | ~2.0 ms         | ~64 ms        | Expression evaluation   |
-| Graph Construction      | ~0.3 ms         | ~10 ms        | Edge list building      |
-| Collation (batching)    | ~1.0 ms         | ~1 ms         | PyG batching overhead   |
-| **Total (cold)**        | **~3.9 ms**     | **~94 ms**    |                         |
-| **Total (pre-computed)**| **~0.9 ms**     | **~30 ms**    | ScaledMBADataset        |
-
-**Recommendation**: For large-scale training (12M samples), pre-compute fingerprints and ASTs offline. `ScaledMBADataset` achieves 3.1× speedup.
-
-### Memory Usage
-
-| Component           | Per Sample (avg) | Batch 32     | Notes                        |
-|---------------------|------------------|--------------|------------------------------|
-| Graph (depth 6)     | ~2 KB            | ~64 KB       | 20 nodes × 32 floats         |
-| Graph (depth 14)    | ~12 KB           | ~384 KB      | 150 nodes (with sharing)     |
-| Fingerprint         | 1.75 KB          | 56 KB        | 448 × float32                |
-| Target sequence     | ~0.5 KB          | ~16 KB       | Avg 64 tokens × 2 bytes      |
-| **Total (depth 6)** | **~4.3 KB**      | **~137 KB**  |                              |
-| **Total (depth 14)**| **~14.3 KB**     | **~457 KB**  |                              |
-
-**GPU Memory**: Batch size 32 on A100 (80GB): ~600 MB for data + ~20 GB for model = comfortable fit.
+| Component | File | Lines |
+|-----------|------|-------|
+| AST Parser | `src/data/ast_parser.py` | 350 |
+| Tokenizer | `src/data/tokenizer.py` | 150 |
+| Fingerprint | `src/data/fingerprint.py` | 250 |
+| Datasets | `src/data/dataset.py` | 450 |
+| Collation | `src/data/collate.py` | 120 |
+| Augmentation | `src/data/augmentation.py` | 80 |
+| DAG Features | `src/data/dag_features.py` | 100 |
+| Walsh-Hadamard | `src/data/walsh_hadamard.py` | 80 |
+| Generator | `scripts/generate_data.py` | 200 |
 
 ---
 
-## 8. Data Augmentation (Not Implemented)
+## 13. Testing
 
-**Future Work**: Potential augmentation strategies:
-
-1. **Variable Renaming**: `x+y` → `a+b` (preserves semantics)
-2. **Commutative Reordering**: `x+y` → `y+x`
-3. **Constant Folding**: `3+5` → `8` (lossy but valid)
-4. **Subexpression Substitution**: Replace `x|y` with `(x&y)+(x^y)` (increases obfuscation)
-
-**Risk**: Invalid augmentations may introduce incorrect equivalences. Requires Z3 verification.
-
----
-
-## 9. Engineering Notes
-
-### Adding New Features to Fingerprint
-
-**To add a new feature component** (e.g., "Fourier features"):
-
-1. Update `src/constants.py`:
-   ```python
-   FOURIER_DIM: int = 32
-   FINGERPRINT_DIM = SYMBOLIC_DIM + CORNER_DIM + RANDOM_DIM + DERIVATIVE_DIM + TRUTH_TABLE_DIM + FOURIER_DIM
-   ```
-
-2. Implement `_fourier_features()` in `SemanticFingerprint`:
-   ```python
-   def _fourier_features(self, expr: str, variables: List[str]) -> np.ndarray:
-       features = np.zeros(FOURIER_DIM, dtype=np.float32)
-       # ... compute Fourier features
-       return features
-   ```
-
-3. Update `compute()`:
-   ```python
-   fp[offset:offset + FOURIER_DIM] = self._fourier_features(expr, variables)
-   offset += FOURIER_DIM
-   ```
-
-4. **Critical**: Regenerate entire dataset with new fingerprints (backward incompatible).
-
-### Debugging Dataset Issues
-
-**Common Issues**:
-
-| Error                          | Cause                          | Fix                                    |
-|--------------------------------|--------------------------------|----------------------------------------|
-| `No valid data loaded`         | Empty JSONL or wrong path      | Check file path, validate JSONL syntax |
-| `Unexpected tokens after pos`  | Invalid expression syntax      | Add validation in data generation      |
-| `KeyError: 'obfuscated'`       | Missing required field         | Validate JSONL schema                  |
-| `RuntimeError: CUDA OOM`       | Batch size too large           | Reduce batch size or max_depth filter  |
-| `AssertionError: fingerprint`  | Dimension mismatch             | Verify FINGERPRINT_DIM in constants.py |
-
-**Validation Script**:
 ```bash
-python scripts/validate_data.py --data data/train.jsonl --check-parse --check-fingerprint
+# Test tokenizer
+pytest tests/test_data.py::test_tokenizer -v
+
+# Test fingerprint
+pytest tests/test_data.py::test_fingerprint -v
+
+# Test AST parser
+pytest tests/test_data.py::test_ast_parser -v
+
+# Test datasets
+pytest tests/test_data.py::test_mba_dataset -v
+
+# Test C++ compatibility
+pytest tests/test_dataset_cpp_compat.py -v
+
+# Validate fingerprint consistency
+python scripts/validate_fingerprint_consistency.py
 ```
 
 ---
 
-## 10. Related Documentation
+## 14. Common Issues & Solutions
 
-- `docs/ML_PIPELINE.md` - Full model architecture (encoder, decoder, heads)
-- `docs/TRAINING.md` - Training phases and curriculum learning
-- `scripts/generate_data.py` - Dataset generation logic
-- `src/models/encoder.py` - GNN encoder that consumes graph data
-- `src/models/decoder.py` - Transformer decoder that consumes fingerprints
+### Issue: Fingerprint Mismatch (C++ vs Python)
+
+**Symptom**: Different fingerprints for same expression
+
+**Cause**: Derivatives computed differently
+
+**Solution**: Use `compute_ml()` which strips derivatives
+```python
+fp = SemanticFingerprint()
+vector = fp.compute_ml(expr)  # 416-dim, no derivatives
+```
+
+### Issue: Out of Memory During Training
+
+**Symptom**: CUDA OOM errors
+
+**Solutions**:
+1. Reduce batch size
+2. Use gradient accumulation
+3. Enable fingerprint caching
+4. Use mixed precision training (`torch.amp`)
+
+### Issue: Slow Data Loading
+
+**Symptom**: GPU underutilized, data loading bottleneck
+
+**Solutions**:
+1. Increase `num_workers` in DataLoader
+2. Enable `pin_memory=True`
+3. Use C++ fingerprint acceleration
+4. Cache fingerprints to disk
+
+### Issue: Variable Name Inconsistencies
+
+**Symptom**: Model sees `y` and `x0` as different variables
+
+**Solution**: Normalize variable names in tokenizer (already implemented)
+```python
+# Automatically renames variables by first appearance
+tokenizer.normalize_variables("(y & z)") → "(x0 & x1)"
+```
 
 ---
 
-**Document Version**: v1.0
-**Last Updated**: 2026-01-16
-**Target Audience**: ML engineers extending data pipeline or debugging preprocessing
+## 15. Best Practices
+
+1. **Always strip derivatives** from fingerprints for ML
+2. **Use C++ acceleration** for large-scale training (10× speedup)
+3. **Cache fingerprints** for repeated expressions
+4. **Normalize variables** to canonical form
+5. **Augment with variable permutations** (80% probability)
+6. **Use curriculum learning** (depth 2→5→10→14)
+7. **Validate fingerprint consistency** before training
+8. **Monitor data loading time** (should be <10% of training time)
+9. **Use multiprocessing** for data loading (4-8 workers)
+10. **Batch by similar lengths** to minimize padding overhead
+
+---
+
+## References
+
+1. **AST Parsing**: Standard compiler techniques
+2. **Graph Construction**: PyTorch Geometric Data format
+3. **Fingerprinting**: Inspired by symbolic execution and hash functions
+4. **Truth Tables**: Boolean function representation
+5. **Variable Augmentation**: Data augmentation for invariance
+6. **Curriculum Learning**: Bengio et al., "Curriculum Learning" (ICML 2009)

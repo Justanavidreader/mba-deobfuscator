@@ -61,6 +61,12 @@ data:
   val_path: data/val.jsonl
   max_depth: null  # No depth filter for contrastive
 
+  # Dataset type: "scaled" for ScaledMBADataset (subexpression sharing)
+  # "mba" for regular MBADataset, "contrastive" for Phase 1
+  dataset_type: scaled
+  share_subexpressions: true  # Enable subexpression sharing in graphs
+  max_seq_len: 256  # Support longer sequences
+
 checkpoint:
   dir: checkpoints/phase1
   resume_from: null  # Path to resume training

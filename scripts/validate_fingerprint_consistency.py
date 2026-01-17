@@ -16,14 +16,15 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 
 # Direct imports to avoid __init__.py chains that pull in torch_scatter
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src', 'data'))
+script_dir = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.join(script_dir, '..')
+sys.path.insert(0, repo_root)
 
-from constants import (
+from src.constants import (
     FINGERPRINT_DIM, SYMBOLIC_DIM, CORNER_DIM,
     RANDOM_DIM, DERIVATIVE_DIM, TRUTH_TABLE_DIM
 )
-from fingerprint import SemanticFingerprint
+from src.data.fingerprint import SemanticFingerprint
 
 
 def get_fingerprint_components() -> List[Tuple[str, int, int]]:
@@ -78,14 +79,30 @@ def validate_sample(
     if not np.allclose(cpp_fp, py_fp, atol=tolerance):
         diff = np.abs(cpp_fp - py_fp)
         component_diffs = {}
+        component_matches = {}
+
         for name, start, end in components:
-            comp_diff = diff[start:end].max()
-            if comp_diff > tolerance:
-                component_diffs[name] = comp_diff
+            comp_cpp = cpp_fp[start:end]
+            comp_py = py_fp[start:end]
+            comp_diff = diff[start:end]
+
+            max_diff = comp_diff.max()
+            matches = np.sum(comp_diff <= tolerance)
+            total = len(comp_diff)
+
+            if max_diff > tolerance:
+                component_diffs[name] = {
+                    'max_diff': float(max_diff),
+                    'matches': int(matches),
+                    'total': int(total),
+                    'match_rate': float(matches / total) if total > 0 else 0.0
+                }
+            component_matches[name] = int(matches)
 
         return {
             'max_diff': diff.max(),
-            'components': component_diffs
+            'components': component_diffs,
+            'matches': component_matches
         }
 
     return None
@@ -118,6 +135,7 @@ def main():
     parser.add_argument('filepath', type=Path, help='JSON or JSONL file to validate')
     parser.add_argument('--samples', '-n', type=int, default=100, help='Max samples')
     parser.add_argument('--tolerance', type=float, default=1e-5, help='Numerical tolerance')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Show per-sample details')
     args = parser.parse_args()
 
     fingerprint = SemanticFingerprint()
@@ -126,10 +144,17 @@ def main():
     print(f"Loading {args.filepath}...")
     samples = load_samples(args.filepath)
     print(f"Found {len(samples)} samples, validating up to {args.samples}")
+    print(f"Tolerance: {args.tolerance}\n")
 
     mismatches = 0
     total = 0
     skipped = 0
+
+    # Track component-level statistics
+    component_names = [name for name, _, _ in components]
+    component_match_counts = {name: 0 for name in component_names}
+    component_total_counts = {name: 0 for name in component_names}
+    component_max_diffs = {name: [] for name in component_names}
 
     for i, item in enumerate(samples[:args.samples]):
         # Check required fields
@@ -137,9 +162,11 @@ def main():
             skipped += 1
             continue
 
-        expr = item.get('obfuscated_expr') or item.get('obfuscated')
+        # C++ fingerprint computed from ground truth (semantic signature)
+        expr = item.get('ground_truth_expr') or item.get('simplified')
         if not expr:
-            print(f"Sample {i}: missing expression")
+            if args.verbose:
+                print(f"Sample {i}: missing ground truth expression")
             skipped += 1
             continue
 
@@ -160,16 +187,51 @@ def main():
                 skipped += 1
             else:
                 mismatches += 1
-                print(f"Sample {i}: max diff = {result['max_diff']:.6f}")
-                print(f"  Expr: {expr[:60]}...")
-                for name, diff in result['components'].items():
-                    print(f"    {name}: max diff = {diff:.6f}")
+                if args.verbose:
+                    print(f"Sample {i}: max diff = {result['max_diff']:.6f}")
+                    print(f"  Expr: {expr[:60]}...")
+                    for name, info in result['components'].items():
+                        match_rate = info['match_rate'] * 100
+                        print(f"    {name}: max diff = {info['max_diff']:.6f}, "
+                              f"matches = {info['matches']}/{info['total']} ({match_rate:.1f}%)")
+
+                # Accumulate component statistics
+                for name, info in result['components'].items():
+                    component_max_diffs[name].append(info['max_diff'])
+                for name, matches in result.get('matches', {}).items():
+                    component_match_counts[name] += matches
+                    _, start, end = [(n, s, e) for n, s, e in components if n == name][0]
+                    component_total_counts[name] += (end - start)
         else:
             total += 1
+            # Perfect match - all components match
+            for name, start, end in components:
+                component_match_counts[name] += (end - start)
+                component_total_counts[name] += (end - start)
 
-    print(f"\nResults: {mismatches}/{total+mismatches} mismatches, {skipped} skipped")
+    # Print summary
+    print("\n" + "=" * 70)
+    print("SUMMARY:")
+    print("=" * 70)
+    for name in component_names:
+        matches = component_match_counts[name]
+        total_dims = component_total_counts[name]
+        if total_dims > 0:
+            match_rate = matches / total_dims * 100
+            max_diffs = component_max_diffs[name]
+            max_diff_val = max(max_diffs) if max_diffs else 0.0
+            status = "✓" if match_rate == 100.0 else "✗"
+            print(f"{status} {name:15s}: {matches:5d}/{total_dims:5d} matches ({match_rate:6.2f}%) | "
+                  f"Max diff: {max_diff_val:.6f}")
+
+    print("\n" + "=" * 70)
+    print(f"Overall: {total}/{total+mismatches} samples fully matched")
+    print(f"Skipped: {skipped} samples")
     if total + mismatches > 0:
-        print(f"Match rate: {total/(total+mismatches)*100:.1f}%")
+        overall_rate = total / (total + mismatches) * 100
+        print(f"Match rate: {overall_rate:.1f}%")
+    print("=" * 70)
+
     return 1 if mismatches > 0 else 0
 
 

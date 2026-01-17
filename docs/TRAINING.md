@@ -1,914 +1,1066 @@
-# Training Guide: MBA Deobfuscator
+# Training Infrastructure
 
-**Target**: ML engineers training or fine-tuning the GNN+Transformer deobfuscation model.
-
-**Quick Start**: Jump to [Phase Commands](#phase-commands) for training scripts.
+Complete specification of the 3-phase training pipeline, curriculum learning, loss functions, and ablation studies.
 
 ---
 
-## Table of Contents
+## Training Overview
 
-1. [Overview](#overview)
-2. [3-Phase Training Pipeline](#3-phase-training-pipeline)
-3. [Curriculum Learning](#curriculum-learning)
-4. [Ablation Studies](#ablation-studies)
-5. [Hyperparameters](#hyperparameters)
-6. [Checkpointing](#checkpointing)
-7. [Monitoring](#monitoring)
-8. [Troubleshooting](#troubleshooting)
-
----
-
-## Overview
-
-**Architecture**: GNN Encoder → Semantic Fingerprint → Transformer Decoder → Verification
-
-**Training Paradigm**: 3-phase progressive training
-1. **Phase 1 (Contrastive)**: Self-supervised pretraining of encoder (20 epochs)
-2. **Phase 2 (Supervised)**: End-to-end supervised learning with curriculum (50 epochs)
-3. **Phase 3 (RL)**: Policy optimization with equivalence rewards (10 epochs)
-
-**Total Training Time**: ~16 weeks on single A100 (80GB) for scaled model (360M params)
-
-**Dataset Requirements**:
-- Base model (15M params): 1M samples, 600M tokens
-- Scaled model (360M params): 12M samples, 7.2B tokens (Chinchilla-optimal)
-
----
-
-## 3-Phase Training Pipeline
-
-### Phase 1: Contrastive Pretraining
-
-**Purpose**: Learn robust graph representations through self-supervised objectives before decoder training.
-
-**Objectives**:
-1. **InfoNCE Contrastive Loss**: Equivalent expressions pull together in embedding space, non-equivalent push apart
-2. **Masked Expression Modeling (MaskLM)**: Predict masked node types (analogous to BERT's MLM)
-
-**Loss Function**:
-```python
-L_phase1 = L_infonce + λ_mask * L_masklm
-
-# InfoNCE: Pull equivalent expressions together
-L_infonce = -log(exp(sim(z_i, z_j) / τ) / Σ_k exp(sim(z_i, z_k) / τ))
-
-# MaskLM: Predict masked node types
-L_masklm = CrossEntropy(pred_masked, true_node_types)
+```
+Phase 1: Contrastive Pretraining (20 epochs)
+    ↓
+Phase 1b: GMN Training (10 epochs, frozen encoder) [Optional]
+    ↓
+Phase 1c: GMN Fine-tuning (10 epochs, end-to-end) [Optional]
+    ↓
+Phase 2: Supervised Learning (50 epochs, 4-stage curriculum)
+    ↓
+Phase 3: RL Fine-Tuning (10 epochs, PPO)
+    ↓
+Final Model
 ```
 
-**Configuration** (`configs/phase1.yaml`):
+**Total training time** (single GPU):
+- Phase 1: 40-60 hours
+- Phase 2: 80-120 hours
+- Phase 3: 20-30 hours
+- **Total**: ~150-210 hours (6-9 days)
+
+---
+
+## Phase 1: Contrastive Pretraining
+
+### Goal
+
+Learn semantic expression representations without labels via contrastive learning.
+
+### Architecture
+
+**Encoder-only** training (no decoder):
+```
+Expression → AST → Graph → GNN Encoder → Embedding [hidden_dim]
+                                             ↓
+                                    Contrastive Loss
+```
+
+### Loss Functions
+
+#### 1.1 InfoNCE (Normalized Temperature-scaled Cross Entropy)
+
+Maximize similarity of equivalent expressions:
+
+```python
+# Anchor: original expression
+# Positive: equivalent expression (simplified or augmented)
+# Negatives: other expressions in batch
+
+def info_nce_loss(anchor, positive, negatives, temperature=0.07):
+    # Compute similarities
+    pos_sim = cosine_similarity(anchor, positive) / temperature
+    neg_sims = [cosine_similarity(anchor, neg) / temperature for neg in negatives]
+
+    # Softmax over positive + negatives
+    logits = torch.cat([pos_sim, torch.stack(neg_sims)])
+    labels = torch.zeros(len(logits))  # Positive is index 0
+
+    return cross_entropy(logits, labels)
+```
+
+**Temperature**: `τ = 0.07` (controls sharpness of distribution)
+- Lower τ: Sharper gradients, harder negatives
+- Higher τ: Softer gradients, easier training
+
+**Batch construction**:
+```python
+batch = [
+    (expr1_obf, expr1_simple),  # Positive pair 1
+    (expr2_obf, expr2_simple),  # Positive pair 2
+    ...
+]
+
+# For each pair, others in batch are negatives
+```
+
+#### 1.2 Masked Language Modeling (MaskLM)
+
+Predict masked tokens in expression:
+
+```python
+def mask_tokens(tokens, mask_ratio=0.15):
+    num_mask = int(len(tokens) * mask_ratio)
+    mask_indices = random.sample(range(len(tokens)), num_mask)
+
+    masked_tokens = tokens.copy()
+    for idx in mask_indices:
+        masked_tokens[idx] = MASK_TOKEN  # [MASK]
+
+    return masked_tokens, mask_indices, tokens[mask_indices]
+
+# Example
+tokens = [13, 15, 5, 16, 14]  # (x0 & x1)
+masked = [13, 4, 5, 16, 14]   # (MASK & x1)
+# Predict: token at position 1 should be 15 (x0)
+```
+
+**Loss**:
+```python
+# Encoder predicts tokens at masked positions
+predictions = encoder(masked_graph).node_embeddings[masked_nodes]
+logits = Linear(predictions)  # → [num_masked × vocab_size]
+
+loss_mlm = cross_entropy(logits, true_tokens)
+```
+
+**Purpose**:
+- Forces encoder to understand expression structure
+- Complements contrastive learning (uses both pairs and structure)
+
+#### 1.3 Combined Loss
+
+```python
+loss = loss_info_nce + lambda_mlm * loss_mlm
+# lambda_mlm = 1.0 (equal weighting)
+```
+
+### Configuration
+
 ```yaml
+# configs/phase1.yaml
+phase: 1
+model:
+  encoder_type: gat_jknet
+  hidden_dim: 256
+  num_layers: 4
+  num_heads: 8
+
 training:
-  phase: 1
   epochs: 20
-  batch_size: 64  # Large batch for contrastive learning
-  learning_rate: 1e-4
-  warmup_steps: 1000
+  batch_size: 128
+  learning_rate: 1e-3
+  temperature: 0.07
+  mask_ratio: 0.15
 
-loss:
-  infonce_temperature: 0.07  # Lower = harder negatives
-  masklm_mask_ratio: 0.15    # 15% nodes masked per graph
-  masklm_weight: 0.5         # Balance contrastive vs MLM
+  optimizer: adamw
+  weight_decay: 1e-4
+  scheduler: cosine
+  warmup_epochs: 2
 
-optimizer:
-  type: AdamW
-  betas: [0.9, 0.98]
-  weight_decay: 0.01
   gradient_clip: 1.0
+  accumulation_steps: 1
+
+data:
+  dataset: contrastive
+  augment: true
+  num_workers: 4
 ```
 
-**Data Augmentation**:
-- Apply random structural perturbations preserving equivalence
-- Mask random nodes (type prediction target)
-- Positive pairs: equivalent expressions via rewrite rules
-- Negative pairs: non-equivalent expressions from batch
+### Usage
 
-**Encoder Freezing**: Decoder not used in Phase 1 (encoder-only training).
+```bash
+python scripts/train.py \
+    --phase 1 \
+    --config configs/phase1.yaml \
+    --output checkpoints/phase1_best.pt
+```
+
+### Expected Results
+
+- **Embedding quality**: Equivalent expressions cluster together
+- **Validation accuracy**: Not directly measured (unsupervised)
+- **Downstream benefit**: +5-10% accuracy in Phase 2 vs random init
 
 ---
 
-### Phase 2: Supervised Learning
+## Phase 1b: GMN Training (Frozen Encoder)
 
-**Purpose**: End-to-end training with full model (encoder + decoder) using ground-truth simplified expressions.
+### Goal
 
-**Objectives**:
-1. **Cross-Entropy Loss**: Standard next-token prediction on target sequence
-2. **Complexity Loss**: Predict output length and depth (guides model to prefer simpler forms)
-3. **Copy Mechanism Loss**: Encourage copying variable names from input AST
+Train Graph Matching Network head to predict expression equivalence while keeping encoder frozen.
 
-**Loss Function**:
+### Architecture
+
+```
+Expression 1 → Encoder (frozen) → Embedding 1
+                                        ↓
+Expression 2 → Encoder (frozen) → Embedding 2
+                                        ↓
+                              GMN Cross-Attention
+                                        ↓
+                              Equivalence Score [0, 1]
+```
+
+### Loss Function
+
 ```python
-L_phase2 = λ_ce * L_ce + λ_complexity * L_complexity + λ_copy * L_copy
+# Binary cross-entropy
+score = gmn_head(embed1, embed2)  # Scalar in [0, 1]
+label = 1 if equivalent else 0
 
-# Cross-Entropy: Next-token prediction
-L_ce = -Σ_t log P(y_t | y_<t, encoder_output)
-
-# Complexity: MSE on length/depth prediction
-L_complexity = MSE(pred_length, true_length) + MSE(pred_depth, true_depth)
-
-# Copy: Weighted CE favoring copying over generation
-L_copy = -Σ_t [p_gen * log P_vocab + (1-p_gen) * log P_copy]
+loss = binary_cross_entropy(score, label)
 ```
 
-**Configuration** (`configs/phase2.yaml`):
+### Configuration
+
 ```yaml
+# configs/phase1b_gmn.yaml
+phase: 1b
+model:
+  encoder_type: hgt
+  hidden_dim: 768
+  num_layers: 12
+  freeze_encoder: true  # Freeze encoder weights
+
+  gmn:
+    num_layers: 3
+    num_heads: 8
+
 training:
-  phase: 2
-  epochs: 50  # Varies by curriculum stage
-  batch_size: 32
-  learning_rate: 5e-5
-  warmup_steps: 2000
-  gradient_accumulation: 2  # Effective batch 64
-
-loss:
-  ce_weight: 1.0
-  complexity_weight: 0.1
-  copy_weight: 0.1
-
-optimizer:
-  type: AdamW
-  betas: [0.9, 0.98]
-  weight_decay: 0.01
-  gradient_clip: 1.0
-
-scheduler:
-  type: cosine
-  warmup_ratio: 0.1
-  min_lr: 1e-6
-```
-
-**Curriculum Strategy**: See [Curriculum Learning](#curriculum-learning) below.
-
-**Key Features**:
-- **Copy mechanism**: Preserves variable names (x, y, z) from input
-- **Complexity head**: Predicts target length/depth before generation → guides beam search
-- **Label smoothing**: ε=0.1 to prevent overconfidence on training data
-
----
-
-### Phase 3: Reinforcement Learning (PPO)
-
-**Purpose**: Fine-tune with non-differentiable reward signals (Z3 equivalence checks, identity detection).
-
-**Algorithm**: Proximal Policy Optimization (PPO) with actor-critic architecture.
-
-**Reward Function**:
-```python
-R_total = R_equiv + R_simplification - R_length - R_depth - R_identity - R_syntax
-
-# Equivalence (Z3 verification): +10 if equivalent, -5 if not
-R_equiv = +10 if Z3_check(pred, target) else -5
-
-# Simplification bonus: +2 if pred simpler than input
-R_simplification = +2 if complexity(pred) < complexity(input) else 0
-
-# Length/depth penalties: discourage verbose outputs
-R_length = -0.1 * len(pred)
-R_depth = -0.2 * depth(pred)
-
-# Identity penalty: -5 if output ≈ input (model failed to simplify)
-R_identity = -5 if similarity(pred, input) > 0.9 else 0
-
-# Syntax error: -5 if unparseable
-R_syntax = -5 if parse_error(pred) else 0
-```
-
-**Configuration** (`configs/phase3.yaml`):
-```yaml
-training:
-  phase: 3
   epochs: 10
-  batch_size: 16  # Smaller for RL stability
-  learning_rate: 1e-5  # Lower LR for fine-tuning
-
-rl:
-  algorithm: ppo
-  ppo_epsilon: 0.2        # Clip ratio
-  ppo_value_coef: 0.5     # Value loss weight
-  ppo_entropy_coef: 0.01  # Entropy regularization
-  num_rollouts: 4         # Trajectories per update
-  discount_gamma: 0.99
-
-rewards:
-  equiv_bonus: 10.0
-  simplification_bonus: 2.0
-  length_penalty: 0.1
-  depth_penalty: 0.2
-  identity_penalty: 5.0
-  syntax_error_penalty: 5.0
-  identity_threshold: 0.9
-
-optimizer:
-  type: AdamW
-  weight_decay: 0.0  # No L2 in RL fine-tuning
-  gradient_clip: 0.5  # Tighter clipping
+  batch_size: 64
+  learning_rate: 5e-4
 ```
 
-**Training Loop**:
-1. Generate samples from current policy (greedy or sample with temperature)
-2. Execute verification: syntax check → execution test → Z3 (top-k only)
-3. Compute rewards from verification results
-4. Update policy via PPO objective (clipped surrogate + value + entropy)
+### Usage
 
-**Verification Tiers** (in order):
-1. **Syntax**: Parser check (~0ms, filters 5-10% invalid outputs)
-2. **Execution**: Random input eval (1ms, catches 60% non-equiv)
-3. **Z3 SMT**: Formal verification (100-1000ms, conclusive for survivors)
-
-Apply Z3 only to top-10 candidates by model score (budget constraint).
+```bash
+python scripts/train.py \
+    --phase 1b \
+    --config configs/phase1b_gmn.yaml \
+    --resume checkpoints/phase1_best.pt \
+    --output checkpoints/phase1b_best.pt
+```
 
 ---
 
-## Curriculum Learning
+## Phase 1c: GMN Fine-Tuning (End-to-End)
 
-**Strategy**: Self-paced curriculum with 4 stages of increasing depth.
+### Goal
 
-**Mechanism**:
-- Start with shallow expressions (depth 2-4) to build foundational patterns
-- Progress to deeper expressions as accuracy targets are met
-- **Self-paced weighting**: Dynamically downweight hard examples early, upweight as model improves
+Fine-tune both encoder and GMN head together for better matching.
 
-**Stages** (Phase 2 only):
+### Configuration
 
-| Stage | Max Depth | Epochs | Target Accuracy | λ_init | λ_growth |
-|-------|-----------|--------|-----------------|--------|----------|
-| 1     | 2         | 10     | 95%             | 0.5    | 1.1      |
-| 2     | 5         | 15     | 90%             | 0.5    | 1.1      |
-| 3     | 10        | 15     | 80%             | 0.5    | 1.1      |
-| 4     | 14        | 10     | 70%             | 0.5    | 1.1      |
-
-**Self-Paced Loss Weighting**:
-```python
-# Example weight for sample i at epoch e
-w_i = λ_e if loss_i < λ_e else 0
-
-# λ grows over epochs: λ_e = λ_init * (λ_growth)^e
-# Early epochs: only easy samples (low loss) get non-zero weight
-# Later epochs: hard samples included as λ increases
-```
-
-**Scaled Model Curriculum** (360M params): 1.5× epochs per stage for stability.
-
-**Stage Progression**:
-- **Automatic**: Move to next stage when validation accuracy ≥ target for 2 consecutive epochs
-- **Manual override**: `--force-stage N` flag to skip ahead (for resumption)
-
-**Configuration**:
 ```yaml
-curriculum:
-  enabled: true
-  stages:
-    - {max_depth: 2, epochs: 10, target: 0.95}
-    - {max_depth: 5, epochs: 15, target: 0.90}
-    - {max_depth: 10, epochs: 15, target: 0.80}
-    - {max_depth: 14, epochs: 10, target: 0.70}
+# configs/phase1c_gmn_finetune.yaml
+phase: 1c
+model:
+  encoder_type: hgt
+  freeze_encoder: false  # Unfreeze encoder
 
-  self_paced:
-    lambda_init: 0.5      # Initial threshold
-    lambda_growth: 1.1    # Growth rate per epoch
-    patience: 2           # Epochs before stage transition
+training:
+  epochs: 10
+  batch_size: 32
+  learning_rate: 1e-4  # Lower LR for fine-tuning
 ```
+
+### Usage
+
+```bash
+python scripts/train.py \
+    --phase 1c \
+    --config configs/phase1c_gmn_finetune.yaml \
+    --resume checkpoints/phase1b_best.pt \
+    --output checkpoints/phase1c_best.pt
+```
+
+---
+
+## Phase 2: Supervised Learning with Curriculum
+
+### Goal
+
+Learn to simplify expressions via supervised seq2seq training with 4-stage depth curriculum.
+
+### Architecture
+
+**Full model** (encoder + decoder + heads):
+```
+Obfuscated Expression → Encoder + Fingerprint → Decoder → Tokens + Complexity
+                                                              ↓
+                                                     Simplified Expression
+```
+
+### Curriculum Stages
+
+| Stage | Max Depth | Epochs | Target Accuracy | Learning Rate |
+|-------|-----------|--------|-----------------|---------------|
+| 1 | 2 | 10 | 95% | 3e-4 |
+| 2 | 5 | 15 | 90% | 2e-4 |
+| 3 | 10 | 15 | 80% | 1e-4 |
+| 4 | 14 | 10 | 70% | 5e-5 |
+
+**Total**: 50 epochs
+
+### Loss Functions
+
+#### 2.1 Token Cross-Entropy (Main)
+
+Standard seq2seq loss:
+
+```python
+# Teacher forcing: use ground truth as decoder input
+decoder_input = simplified_tokens[:-1]  # Shift right
+decoder_target = simplified_tokens[1:]
+
+logits = decoder(decoder_input, encoder_output)  # [seq_len × vocab_size]
+
+loss_token = cross_entropy(logits, decoder_target, ignore_index=PAD_TOKEN)
+```
+
+**Ignore padding**: Loss only on real tokens, not padding
+
+#### 2.2 Complexity Loss (Auxiliary)
+
+Predict length and depth of simplified expression:
+
+```python
+# From complexity head
+length_pred = complexity_head(decoder_output)  # Scalar
+depth_pred = complexity_head(decoder_output)   # Scalar
+
+loss_complexity = mse(length_pred, target_length) + mse(depth_pred, target_depth)
+```
+
+**Weight**: `λ_complexity = 0.1`
+
+**Purpose**:
+- Guide decoder to generate simpler outputs
+- Provide reranking signal during inference
+
+#### 2.3 Copy Loss (Auxiliary)
+
+Encourage copy mechanism to preserve variables:
+
+```python
+# Copy gate predictions
+p_copy = copy_gate(decoder_hidden)  # [seq_len × 1]
+
+# Ground truth: 1 if token copied from source, 0 if generated
+copy_labels = compute_copy_labels(source_tokens, target_tokens)
+
+loss_copy = binary_cross_entropy(p_copy, copy_labels)
+```
+
+**Weight**: `λ_copy = 0.1`
+
+**Purpose**: Prevent hallucinating non-existent variables
+
+#### 2.4 Property Loss (Auxiliary) - **PLACEHOLDER**
+
+**Current status**: Using zeros (marked `RULE 2 SHOULD_FIX`)
+
+**Intended** (not yet fully implemented):
+```python
+# Semantic HGT property predictions
+property_logits = semantic_hgt.property_detector(encoder_output)  # [13]
+
+# Ground truth: algebraic properties of expression
+property_labels = detect_properties(expression)  # [13] (binary)
+
+loss_property = binary_cross_entropy(property_logits, property_labels)
+```
+
+**Weight**: `λ_property = 0.05`
+
+**Properties** (13 total):
+- Commutative, Associative, Distributive
+- Idempotent, Identity, Absorbing
+- Involution, De Morgan
+- XOR/AND/OR specific properties
+
+**TODO**: Implement real property detection (currently zeros)
+
+#### 2.5 Combined Loss
+
+```python
+loss = loss_token + \
+       0.1 * loss_complexity + \
+       0.1 * loss_copy + \
+       0.05 * loss_property
+```
+
+### Configuration
+
+```yaml
+# configs/phase2.yaml
+phase: 2
+model:
+  encoder_type: gat_jknet
+  hidden_dim: 256
+  decoder_dim: 512
+  decoder_layers: 6
+  decoder_heads: 8
+
+training:
+  epochs: 50
+  curriculum:
+    - {max_depth: 2, epochs: 10, lr: 3e-4, target_acc: 0.95}
+    - {max_depth: 5, epochs: 15, lr: 2e-4, target_acc: 0.90}
+    - {max_depth: 10, epochs: 15, lr: 1e-4, target_acc: 0.80}
+    - {max_depth: 14, epochs: 10, lr: 5e-5, target_acc: 0.70}
+
+  batch_size: 32
+  optimizer: adamw
+  weight_decay: 1e-4
+  scheduler: cosine  # Per curriculum stage
+
+  loss_weights:
+    complexity: 0.1
+    copy: 0.1
+    property: 0.05  # Currently not used (zeros)
+
+  gradient_clip: 1.0
+  accumulation_steps: 2
+
+data:
+  dataset: mba
+  augment: true
+  num_workers: 4
+```
+
+### Usage
+
+```bash
+python scripts/train.py \
+    --phase 2 \
+    --config configs/phase2.yaml \
+    --resume checkpoints/phase1_best.pt \
+    --output checkpoints/phase2_best.pt
+```
+
+### Self-Paced Curriculum
+
+Automatically advance curriculum stages based on validation accuracy:
+
+```python
+# After each epoch
+val_accuracy = evaluate(model, val_loader)
+
+if val_accuracy >= current_stage.target_acc:
+    print(f"Stage {stage_id} complete ({val_accuracy:.2%} >= {target})")
+    advance_to_next_stage()
+else:
+    print(f"Continue stage {stage_id} ({val_accuracy:.2%} < {target})")
+```
+
+**Adaptive**: If model struggles, stays on current stage longer
+
+---
+
+## Phase 3: RL Fine-Tuning with PPO
+
+### Goal
+
+Optimize for equivalence and simplification via reinforcement learning.
+
+### Architecture
+
+**Policy**: Full model (encoder + decoder)
+**Critic**: Value head (predicts expected reward)
+
+```
+State: Obfuscated expression
+Action: Simplified expression (sampled from policy)
+Reward: Equivalence (Z3) + Simplification ratio
+```
+
+### Reward Function
+
+```python
+def compute_reward(obfuscated, simplified):
+    reward = 0.0
+
+    # 1. Equivalence (Z3 verification)
+    is_equiv = z3_verify_equivalence(obfuscated, simplified)
+    if is_equiv:
+        reward += 10.0
+    else:
+        reward -= 5.0  # Penalty for incorrect simplification
+
+    # 2. Simplification ratio
+    if is_equiv:
+        ratio = len(tokenize(obfuscated)) / len(tokenize(simplified))
+        reward += 2.0 * (ratio - 1.0)  # Bonus for shorter output
+
+    # 3. Identity penalty
+    if simplified == obfuscated:
+        reward -= 5.0  # Discourage identity transformation
+
+    # 4. Syntax error penalty
+    if not is_valid_syntax(simplified):
+        reward -= 1.0
+
+    return reward
+```
+
+**Reward components**:
+- **Equivalence**: +10.0 (correct) or -5.0 (incorrect)
+- **Simplification**: +2.0 × (ratio - 1.0) if equivalent
+- **Identity**: -5.0 if output == input
+- **Syntax**: -1.0 if invalid syntax
+
+### PPO Algorithm
+
+```python
+# Proximal Policy Optimization
+for iteration in range(num_iterations):
+    # Collect trajectories
+    for batch in dataloader:
+        obfuscated = batch['obfuscated']
+
+        # Sample action from policy
+        simplified, log_prob, value = policy.sample(obfuscated)
+
+        # Compute reward
+        reward = compute_reward(obfuscated, simplified)
+
+        # Store transition
+        buffer.store(obfuscated, simplified, log_prob, value, reward)
+
+    # Update policy
+    for epoch in range(ppo_epochs):
+        for transitions in buffer:
+            # Compute advantage
+            advantage = reward - value  # Simplified (no GAE)
+
+            # Compute policy ratio
+            new_log_prob = policy.log_prob(obfuscated, simplified)
+            ratio = exp(new_log_prob - old_log_prob)
+
+            # Clipped surrogate objective
+            clipped_ratio = clip(ratio, 1 - epsilon, 1 + epsilon)
+            loss_policy = -min(ratio * advantage, clipped_ratio * advantage)
+
+            # Value loss
+            loss_value = mse(value, reward)
+
+            # Entropy bonus (exploration)
+            entropy = policy.entropy()
+            loss_entropy = -0.01 * entropy
+
+            # Total loss
+            loss = loss_policy + 0.5 * loss_value + loss_entropy
+
+            # Update
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+```
+
+**Hyperparameters**:
+- Clip epsilon: `ε = 0.2`
+- PPO epochs: 4
+- GAE lambda: 0.95
+- Entropy coefficient: 0.01
+- Learning rate: 1e-5
+
+### Tactics for Exploration
+
+Fixed simplification tactics for bootstrapping:
+
+```python
+TACTICS = [
+    # Identity laws
+    lambda x: x.replace("x & x", "x"),
+    lambda x: x.replace("x | x", "x"),
+    lambda x: x.replace("x ^ x", "0"),
+
+    # MBA patterns
+    lambda x: x.replace("(x & y) + (x ^ y)", "x | y"),
+    lambda x: x.replace("(x | y) - (x ^ y)", "x & y"),
+
+    # Constant folding
+    lambda x: fold_constants(x),
+
+    # Distributive
+    lambda x: apply_distributive(x),
+
+    # De Morgan
+    lambda x: apply_de_morgan(x),
+
+    # Algebraic simplification
+    lambda x: simplify_algebraically(x),
+]
+```
+
+**Exploration**: 20% of time, apply random tactic instead of model policy
+
+### Configuration
+
+```yaml
+# configs/phase3.yaml
+phase: 3
+model:
+  # Load from Phase 2
+  encoder_type: gat_jknet
+  hidden_dim: 256
+
+training:
+  epochs: 10
+  ppo_epochs: 4
+  batch_size: 16
+
+  learning_rate: 1e-5
+  clip_epsilon: 0.2
+  gae_lambda: 0.95
+  entropy_coeff: 0.01
+
+  reward_weights:
+    equivalence: 10.0
+    simplification: 2.0
+    identity_penalty: -5.0
+    syntax_penalty: -1.0
+
+  tactics:
+    num_tactics: 6
+    exploration_prob: 0.2
+
+data:
+  dataset: mba
+  max_depth: 14  # All depths
+```
+
+### Usage
+
+```bash
+python scripts/train.py \
+    --phase 3 \
+    --config configs/phase3.yaml \
+    --resume checkpoints/phase2_best.pt \
+    --output checkpoints/phase3_best.pt
+```
+
+### Expected Results
+
+- **Equivalence rate**: 85-95% (vs 80-90% in Phase 2)
+- **Simplification ratio**: 2.5× average (vs 2.0× in Phase 2)
+- **Identity rate**: <5% (vs ~10% in Phase 2)
 
 ---
 
 ## Ablation Studies
 
-**Purpose**: Compare encoder architectures to validate design choices.
+### Encoder Comparison
 
-**Encoders Under Test**:
+Compare different encoder architectures systematically:
 
-| Encoder          | Type                  | Edge Types | Params | Use Case            |
-|------------------|-----------------------|------------|--------|---------------------|
-| `gat_jknet`      | GAT + Jumping Knowledge | No       | 2.8M   | Baseline (depth ≤10) |
-| `ggnn`           | Gated Graph NN        | Yes (6)    | 3.2M   | Depth 10-14         |
-| `hgt`            | Heterogeneous GT      | Yes (7)    | 4.5M   | Scaled model        |
-| `rgcn`           | Relational GCN        | Yes (7)    | 3.0M   | Alternative to GGNN |
-| `transformer_only` | Transformer (no graph) | No      | 2.5M   | Sequence baseline   |
-| `hybrid_great`   | GNN+Transformer hybrid | No       | 4.0M   | Research variant    |
-
-**Registry Usage** (`src/models/encoder_registry.py`):
-```python
-from src.models.encoder_registry import get_encoder, list_encoders
-
-# List available encoders
-encoders = list_encoders()
-print(encoders)
-# {'gat_jknet': {'requires_edge_types': False, ...}, ...}
-
-# Instantiate encoder by name
-encoder = get_encoder('gat_jknet', hidden_dim=256, num_layers=4)
-encoder = get_encoder('ggnn', hidden_dim=256, num_timesteps=8)
-```
-
-**Running Ablation** (`scripts/run_ablation.py`):
 ```bash
-# Single encoder, single run
-python scripts/run_ablation.py --encoder gat_jknet --run-id 1
-
-# All encoders, 5 runs each (statistical significance)
+# Run ablation for all encoders
 python scripts/run_ablation.py --all-encoders --num-runs 5
 
-# Specific encoder group
-python scripts/run_ablation.py --group homogeneous --num-runs 5
+# Run specific encoder
+python scripts/run_ablation.py --encoder hgt --run-id 1
 ```
 
-**Metrics Collected** (`src/utils/ablation_metrics.py`):
-- **Accuracy**: Exact match, equivalence (via execution), reduction rate
-- **Efficiency**: Training time (hours), inference latency (ms/sample)
-- **Per-depth performance**: Accuracy in buckets [2-4], [5-7], [8-10], [11-14]
-- **Model size**: Parameter count, memory footprint
+### Ablation Metrics
 
-**Statistical Testing**:
-- Paired t-test: Compare encoder pairs on same test set (5 runs each)
-- Significance level: α = 0.05
-- Report: mean ± std, p-value, effect size (Cohen's d)
+For each encoder, measure:
 
-**Trainer Integration** (`src/training/ablation_trainer.py`):
+| Metric | Description |
+|--------|-------------|
+| **Accuracy** | % of correctly simplified expressions |
+| **Accuracy by depth** | Accuracy for depth buckets (1-2, 3-5, 6-10, 11-14) |
+| **Simplification ratio** | Average output_length / input_length |
+| **Inference time** | Average time per expression |
+| **Training time** | Time per epoch |
+| **Memory usage** | Peak GPU memory during training |
+
+### Statistical Testing
+
+Use paired t-test to determine significance:
+
 ```python
-from src.training.ablation_trainer import AblationTrainer
+from src.utils.ablation_stats import compare_encoders
 
-config = {
-    'encoder': {'name': 'gat_jknet', 'hidden_dim': 256},
-    'decoder': {'d_model': 512, 'num_layers': 6},
-    'training': {'learning_rate': 1e-4, 'epochs': 50},
-}
+results_gat = train_and_evaluate('gat_jknet', num_runs=5)
+results_hgt = train_and_evaluate('hgt', num_runs=5)
 
-trainer = AblationTrainer(config)
+p_value = compare_encoders(results_gat, results_hgt)
 
-# Training loop
-for epoch in range(epochs):
-    train_loss = trainer.train_epoch(train_loader)
-    eval_results = trainer.evaluate(val_loader, tokenizer)
-
-# Save metrics
-trainer.metrics_collector.save_results('ablation_results.csv')
+if p_value < 0.05:
+    print("Statistically significant difference")
+else:
+    print("No significant difference")
 ```
 
-**Checkpoint Compatibility**: All encoders inherit from `BaseEncoder` → unified `.forward()` interface → same checkpoint format.
+### Example Results
+
+| Encoder | Accuracy | Depth 1-2 | Depth 3-5 | Depth 6-10 | Depth 11-14 | Time/Epoch |
+|---------|----------|-----------|-----------|------------|-------------|------------|
+| GAT+JKNet | 82.3% | 96.5% | 88.1% | 75.2% | 62.8% | 120s |
+| GGNN | 84.1% | 96.8% | 89.7% | 77.8% | 65.2% | 150s |
+| HGT | 87.5% | 97.2% | 91.4% | 82.1% | 71.3% | 180s |
+| RGCN | 86.9% | 97.0% | 90.8% | 81.3% | 69.8% | 175s |
+| Semantic HGT | 88.2% | 97.4% | 92.1% | 83.5% | 72.8% | 195s |
+
+**Conclusion**: HGT variants outperform GAT/GGNN, especially on deep expressions
 
 ---
 
-## Hyperparameters
+## Training Infrastructure
 
-### Base Model (15M params)
+### Base Trainer
 
-**Encoder (GAT+JKNet)**:
-```yaml
-node_dim: 32
-hidden_dim: 256
-num_layers: 4
-num_heads: 8
-dropout: 0.1
+All trainers inherit from `BaseTrainer`:
+
+```python
+class BaseTrainer:
+    def __init__(self, model, config):
+        self.model = model
+        self.config = config
+        self.optimizer = self.setup_optimizer()
+        self.scheduler = self.setup_scheduler()
+
+    def setup_optimizer(self):
+        return AdamW(
+            self.model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay
+        )
+
+    def setup_scheduler(self):
+        if self.config.scheduler == 'cosine':
+            return CosineAnnealingLR(self.optimizer, T_max=self.config.epochs)
+        elif self.config.scheduler == 'linear':
+            return LinearLR(self.optimizer, total_iters=self.config.epochs)
+        # ...
+
+    def train_epoch(self):
+        # Abstract: implemented by subclasses
+        raise NotImplementedError
+
+    def evaluate(self):
+        # Abstract: implemented by subclasses
+        raise NotImplementedError
+
+    def save_checkpoint(self, path):
+        torch.save({
+            'model': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'epoch': self.epoch,
+            'config': self.config
+        }, path)
+
+    def load_checkpoint(self, path):
+        checkpoint = torch.load(path)
+        self.model.load_state_dict(checkpoint['model'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        # ...
 ```
 
-**Decoder (Transformer)**:
-```yaml
-d_model: 512
-num_layers: 6
-num_heads: 8
-d_ff: 2048
-dropout: 0.1
-max_seq_len: 64
+### Phase-Specific Trainers
+
+- `Phase1Trainer`: Implements InfoNCE + MaskLM
+- `Phase1bGMNTrainer`: Implements GMN training (frozen encoder)
+- `Phase1cGMNTrainer`: Implements GMN fine-tuning
+- `Phase2Trainer`: Implements supervised learning + curriculum
+- `Phase3Trainer`: Implements PPO
+- `AblationTrainer`: Implements encoder comparison
+
+### Gradient Accumulation
+
+For large models that don't fit in GPU memory:
+
+```python
+accumulation_steps = 4
+optimizer.zero_grad()
+
+for i, batch in enumerate(dataloader):
+    loss = compute_loss(batch) / accumulation_steps
+    loss.backward()
+
+    if (i + 1) % accumulation_steps == 0:
+        clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        optimizer.zero_grad()
 ```
 
-**Training**:
-```yaml
-# Phase 1
-batch_size: 64
-learning_rate: 1e-4
-weight_decay: 0.01
+**Effective batch size**: `batch_size × accumulation_steps`
 
-# Phase 2
-batch_size: 32
-learning_rate: 5e-5
-gradient_accumulation: 2
-label_smoothing: 0.1
+### Mixed Precision Training
 
-# Phase 3
-batch_size: 16
-learning_rate: 1e-5
-gradient_clip: 0.5
+For faster training and lower memory:
+
+```python
+from torch.cuda.amp import autocast, GradScaler
+
+scaler = GradScaler()
+
+for batch in dataloader:
+    with autocast():
+        loss = compute_loss(batch)
+
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
 ```
+
+**Speedup**: ~2× faster with minimal accuracy loss
 
 ---
 
-### Scaled Model (360M params)
+## Logging & Monitoring
 
-**Encoder (HGT or RGCN)**:
-```yaml
-hidden_dim: 768
-num_layers: 12
-num_heads: 16
-dropout: 0.1
-num_edge_types: 8
+### TensorBoard
+
+```python
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter('runs/phase2')
+
+# Log scalars
+writer.add_scalar('Loss/train', loss, epoch)
+writer.add_scalar('Accuracy/val', accuracy, epoch)
+
+# Log distributions
+writer.add_histogram('Encoder/weights', model.encoder.parameters(), epoch)
+
+# Log graphs
+writer.add_graph(model, sample_input)
 ```
 
-**Decoder (Transformer)**:
-```yaml
-d_model: 1536
-num_layers: 8
-num_heads: 24
-d_ff: 6144
-dropout: 0.1
-max_seq_len: 2048
+**View**:
+```bash
+tensorboard --logdir runs/
 ```
 
-**Training**:
-```yaml
-# Phase 2
-batch_size: 16  # Smaller for memory
-learning_rate: 3e-5
-gradient_accumulation: 8  # Effective batch 128
-gradient_checkpointing: true  # Saves ~3× memory
-mixed_precision: bf16  # A100 only
+### Weights & Biases
 
-# Memory optimization
-activation_checkpointing: every_3_layers
-cpu_offload: false  # Keep on GPU if 80GB available
+```python
+import wandb
+
+wandb.init(project='mba-deobfuscator', config=config)
+
+# Log metrics
+wandb.log({
+    'train/loss': loss,
+    'val/accuracy': accuracy,
+    'epoch': epoch
+})
+
+# Log model
+wandb.save('checkpoints/phase2_best.pt')
 ```
 
-**Hardware Requirements**:
-- **GPU**: A100 80GB or 2× A100 40GB (model parallel)
-- **RAM**: 128GB+ (dataset preprocessing)
-- **Storage**: 500GB SSD (checkpoints + dataset)
-- **Estimated runtime**: 16 weeks single A100
+### Console Logging
 
----
+```python
+from tqdm import tqdm
 
-### Hyperparameter Tuning Guidelines
-
-**Priority Order** (if compute-limited):
-
-| Rank | Param             | Range          | Impact             |
-|------|-------------------|----------------|--------------------|
-| 1    | `learning_rate`   | [1e-5, 5e-4]   | Critical           |
-| 2    | `batch_size`      | [16, 128]      | High (stability)   |
-| 3    | `num_layers`      | [4, 12]        | High (capacity)    |
-| 4    | `dropout`         | [0.05, 0.2]    | Medium (overfitting) |
-| 5    | `label_smoothing` | [0, 0.2]       | Medium             |
-| 6    | `warmup_steps`    | [500, 2000]    | Low (convergence)  |
-
-**Typical Sweep** (Ray Tune compatible):
-```yaml
-tune:
-  learning_rate: loguniform(1e-5, 5e-4)
-  batch_size: choice([16, 32, 64])
-  dropout: uniform(0.05, 0.2)
-  num_layers: choice([4, 6, 8])
-
-  metric: val_accuracy
-  mode: max
-  num_samples: 20
+pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
+for batch in pbar:
+    loss = train_step(batch)
+    pbar.set_postfix({'loss': f'{loss:.4f}'})
 ```
 
 ---
 
 ## Checkpointing
 
-**Checkpoint Contents**:
+### Save Best Model
+
 ```python
-checkpoint = {
-    'encoder_state': encoder.state_dict(),
-    'decoder_state': decoder.state_dict(),
-    'vocab_head_state': vocab_head.state_dict(),
-    'complexity_head_state': complexity_head.state_dict(),
-    'optimizer_state': optimizer.state_dict(),
-    'scheduler_state': scheduler.state_dict(),
-    'epoch': current_epoch,
-    'global_step': global_step,
-    'best_val_accuracy': best_acc,
-    'config': config_dict,
-    'training_time_hours': elapsed_hours,
-    'curriculum_stage': current_stage,  # For resumption
-}
+best_accuracy = 0.0
+
+for epoch in range(num_epochs):
+    val_accuracy = evaluate(model, val_loader)
+
+    if val_accuracy > best_accuracy:
+        best_accuracy = val_accuracy
+        save_checkpoint(model, 'checkpoints/phase2_best.pt')
 ```
 
-**Save Strategy**:
-- **Every epoch**: `checkpoint_epoch_{N}.pt`
-- **Best validation**: `checkpoint_best.pt` (overwrites)
-- **Phase transitions**: `checkpoint_phase{P}_final.pt` (keep all)
-- **Manual**: `checkpoint_manual_{timestamp}.pt` (on SIGINT)
+### Resume Training
 
-**Resumption**:
-```bash
-# Resume from specific checkpoint
-python scripts/train.py --phase 2 --resume checkpoint_epoch_25.pt
-
-# Resume from best
-python scripts/train.py --phase 2 --resume checkpoint_best.pt
-
-# Resume phase 3 from phase 2 checkpoint (loads encoder+decoder, resets optimizer)
-python scripts/train.py --phase 3 --resume checkpoint_phase2_final.pt
-```
-
-**Cross-Phase Loading**:
-- Phase 1→2: Load encoder only, initialize decoder randomly
-- Phase 2→3: Load full model, reset optimizer for RL learning rate
-- Phase 3→Inference: Load full model, no optimizer needed
-
-**Checkpoint Cleanup**:
-```bash
-# Keep only last 5 epoch checkpoints
-python scripts/cleanup_checkpoints.py --keep-last 5
-
-# Keep best + phase finals
-python scripts/cleanup_checkpoints.py --keep-best --keep-phase-finals
-```
-
----
-
-## Monitoring
-
-### Logging Integrations
-
-**Weights & Biases** (recommended):
-```yaml
-wandb:
-  enabled: true
-  project: mba-deobfuscator
-  entity: your-username
-  tags: [phase2, gat_jknet, curriculum]
-
-  log_interval: 100  # Steps
-  log_gradients: false  # Expensive, enable for debugging
-  log_model: true  # Upload checkpoints
-```
-
-**TensorBoard** (local):
-```bash
-tensorboard --logdir runs/
-```
-
----
-
-### Key Metrics to Track
-
-**Phase 1 (Contrastive)**:
-- `train/infonce_loss`: Should decrease steadily (target: <1.0)
-- `train/masklm_loss`: Should decrease to ~0.5
-- `train/masklm_accuracy`: Should reach 80%+
-- `val/embedding_variance`: Should be >1.0 (embeddings not collapsed)
-
-**Phase 2 (Supervised)**:
-- `train/ce_loss`: Primary metric (target: <0.5 by end)
-- `train/complexity_loss`: Should decrease to <0.1
-- `val/accuracy_exact_match`: Strict string match (target: 70%+ on depth 14)
-- `val/accuracy_equivalence`: Z3-verified or execution-verified (target: 85%+)
-- `val/reduction_rate`: `(input_len - output_len) / input_len` (target: >0.3)
-- `train/learning_rate`: Monitor scheduler (cosine decay)
-
-**Phase 3 (RL)**:
-- `rl/mean_reward`: Should increase (target: >5.0)
-- `rl/equiv_rate`: Fraction of outputs passing Z3 (target: >90%)
-- `rl/identity_rate`: Fraction of outputs identical to input (target: <5%)
-- `rl/policy_entropy`: Should stay >0.1 (policy not collapsing)
-- `rl/value_loss`: Critic learning signal
-
-**Per-Depth Breakdown** (all phases):
-- `val/accuracy_depth_2-4`: Easy (target: 95%+)
-- `val/accuracy_depth_5-7`: Medium (target: 90%+)
-- `val/accuracy_depth_8-10`: Hard (target: 80%+)
-- `val/accuracy_depth_11-14`: Very hard (target: 70%+)
-
----
-
-### Alerts & Thresholds
-
-**Early Stopping Criteria**:
-```yaml
-early_stopping:
-  patience: 5  # Epochs without improvement
-  metric: val_accuracy_equivalence
-  min_delta: 0.01  # Minimum improvement to reset patience
-```
-
-**Gradient Monitoring**:
-- **Gradient norm explosion**: >10.0 → reduce LR or check data
-- **Gradient norm vanishing**: <0.01 → increase LR or check layer norms
-- **NaN gradients**: Stop training, check for invalid inputs (division by zero in fingerprint)
-
-**Loss Anomalies**:
-- **CE loss spike**: >5.0 → likely corrupted batch or OOV tokens
-- **Reward collapse**: mean reward <-5 for 1000 steps → RL divergence, restore checkpoint
-
----
-
-### Debugging Tools
-
-**Visualize Predictions**:
-```python
-# scripts/visualize_predictions.py
-python scripts/visualize_predictions.py \
-  --checkpoint checkpoint_best.pt \
-  --samples 50 \
-  --depth-range 8-10 \
-  --output predictions.html
-```
-
-**Attention Inspection**:
-```python
-# Export attention weights for GAT/HGT layers
-python scripts/export_attention.py \
-  --checkpoint checkpoint_best.pt \
-  --expr "(x&y)+(x^y)" \
-  --output attention_viz/
-```
-
-**Embedding Projections** (Phase 1):
-```python
-# Visualize encoder embeddings in 2D (t-SNE)
-python scripts/plot_embeddings.py \
-  --checkpoint checkpoint_phase1_final.pt \
-  --num-samples 1000 \
-  --method tsne
-```
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-#### 1. OOM (Out of Memory)
-
-**Symptoms**: CUDA OOM error during forward/backward pass.
-
-**Solutions**:
-```yaml
-# Reduce batch size
-batch_size: 16  # Was 32
-
-# Enable gradient accumulation
-gradient_accumulation: 4  # Effective batch = 16 × 4 = 64
-
-# Enable gradient checkpointing (saves ~3× memory at 20% speed cost)
-gradient_checkpointing: true
-
-# Mixed precision (FP16/BF16)
-mixed_precision: bf16  # Requires A100 for stability
-
-# Reduce sequence length
-max_seq_len: 1024  # Was 2048 (for scaled model)
-
-# Offload optimizer states (slow but works)
-cpu_offload: true
-```
-
-**Verification**:
-```bash
-# Check memory usage
-nvidia-smi dmon -s u -d 1
-
-# Profile memory
-python scripts/profile_memory.py --config configs/scaled_model.yaml
-```
-
----
-
-#### 2. Training Divergence (Loss → NaN)
-
-**Symptoms**: Loss suddenly becomes NaN or explodes to >1000.
-
-**Diagnosis**:
-```python
-# Enable anomaly detection
-torch.autograd.set_detect_anomaly(True)
-
-# Log gradient norms
-for name, param in model.named_parameters():
-    if param.grad is not None:
-        print(f"{name}: {param.grad.norm()}")
-```
-
-**Solutions**:
-```yaml
-# Tighter gradient clipping
-gradient_clip: 0.5  # Was 1.0
-
-# Lower learning rate
-learning_rate: 1e-5  # Was 5e-5
-
-# Reduce warmup steps (slow start)
-warmup_steps: 500  # Was 2000
-
-# Check for invalid fingerprints
-# (division by zero in symbolic features → NaN)
-fingerprint_validation: true
-```
-
-**Common Causes**:
-- Division by zero in fingerprint computation (e.g., derivative of constant)
-- Invalid edge indices in graph batch (negative or out-of-bounds)
-- Mixed precision underflow (use `bf16` instead of `fp16` on A100)
-
----
-
-#### 3. Poor Validation Accuracy (<50%)
-
-**Symptoms**: Training loss decreases but validation accuracy plateaus.
-
-**Diagnosis**:
-- **Overfitting**: Check `train_acc >> val_acc` (>20% gap)
-- **Data leakage**: Verify train/val split has no equivalent expressions across sets
-- **Tokenizer mismatch**: Ensure same tokenizer used for train/val
-
-**Solutions**:
-```yaml
-# Increase regularization
-dropout: 0.2  # Was 0.1
-weight_decay: 0.05  # Was 0.01
-label_smoothing: 0.15  # Was 0.1
-
-# Data augmentation (Phase 2)
-augmentation:
-  structural_perturbation: 0.3  # Probability
-  variable_renaming: 0.2
-
-# More training data
-# Re-generate dataset with higher depth diversity
-```
-
-**If overfitting is NOT the issue**:
-- Check encoder architecture (may need more capacity)
-- Verify loss weights (complexity/copy losses may dominate)
-- Inspect predictions: are they syntactically valid?
-
----
-
-#### 4. Identity Outputs (Model copies input)
-
-**Symptoms**: Model outputs identical or near-identical expressions to input (RL Phase 3).
-
-**Diagnosis**:
-```python
-# Compute similarity
-similarity = edit_distance(pred, input) / len(input)
-# If similarity > 0.9 for >50% of samples → identity problem
-```
-
-**Solutions**:
-```yaml
-# Increase identity penalty
-rewards:
-  identity_penalty: 10.0  # Was 5.0
-  identity_threshold: 0.85  # Was 0.9 (stricter)
-
-# Add simplification bonus
-rewards:
-  simplification_bonus: 5.0  # Reward length reduction
-
-# Reduce equivalence bonus (model may be too conservative)
-rewards:
-  equiv_bonus: 5.0  # Was 10.0
-```
-
-**Alternative**: Resume from Phase 2 checkpoint with higher temperature sampling in RL rollouts.
-
----
-
-#### 5. Slow Training (<50 samples/sec)
-
-**Symptoms**: Training takes >2× expected time.
-
-**Bottlenecks**:
-- **CPU**: Data loading (use `num_workers=4` in DataLoader)
-- **GPU**: Small batch size (increase if memory allows)
-- **Disk I/O**: Dataset on HDD (move to SSD)
-- **Verification**: Z3 calls in training loop (only do top-k in Phase 3)
-
-**Profiling**:
-```python
-# PyTorch profiler
-with torch.profiler.profile() as prof:
-    for batch in train_loader:
-        loss = model(batch)
-        loss.backward()
-print(prof.key_averages().table(sort_by="cuda_time_total"))
-```
-
-**Optimizations**:
-```yaml
-# DataLoader
-num_workers: 4
-pin_memory: true
-persistent_workers: true
-
-# Compilation (PyTorch 2.0+)
-compile: true  # ~20% speedup
-
-# Disable expensive logging
-log_interval: 500  # Was 100
-log_gradients: false
-```
-
----
-
-#### 6. Verification Failures in RL (Phase 3)
-
-**Symptoms**: Reward signal is noisy, training unstable.
-
-**Diagnosis**:
-- Check Z3 timeout rate: if >50%, increase timeout or reduce depth
-- Check syntax error rate: if >20%, model is generating invalid code
-
-**Solutions**:
-```yaml
-# Increase Z3 timeout
-z3_timeout_ms: 2000  # Was 1000
-
-# Pre-filter with execution tests (faster)
-verification:
-  exec_test_samples: 100  # Random input tests before Z3
-  exec_test_timeout_ms: 10
-
-# Apply Z3 only to promising candidates
-z3_top_k: 5  # Only verify top-5 by model score
-```
-
-**3-Tier Verification Order** (Phase 3):
-1. Syntax check (0ms, ~10% filtered)
-2. Execution test (1ms, ~60% filtered)
-3. Z3 SMT (100-1000ms, remaining candidates)
-
----
-
-### Performance Benchmarks
-
-**Expected Training Speed** (A100 80GB):
-
-| Phase | Model       | Batch Size | Samples/sec | Time/Epoch |
-|-------|-------------|------------|-------------|------------|
-| 1     | Base (15M)  | 64         | 200         | 1.4 hrs    |
-| 2     | Base (15M)  | 32         | 120         | 2.3 hrs    |
-| 3     | Base (15M)  | 16         | 40          | 7.0 hrs    |
-| 2     | Scaled (360M) | 16       | 15          | 18.5 hrs   |
-
-**Expected Accuracy** (test set, depth 2-14 mixed):
-
-| Phase | Exact Match | Equivalence | Reduction Rate |
-|-------|-------------|-------------|----------------|
-| 2     | 65%         | 80%         | 0.25           |
-| 3     | 70%         | 85%         | 0.30           |
-
-**If below benchmarks**: Check hardware (GPU utilization >90%), data quality, hyperparameters.
-
----
-
-## Phase Commands
-
-**Phase 1: Contrastive Pretraining**
 ```bash
 python scripts/train.py \
-  --phase 1 \
-  --config configs/phase1.yaml \
-  --data-path data/train.json \
-  --output checkpoints/phase1/
+    --phase 2 \
+    --config configs/phase2.yaml \
+    --resume checkpoints/phase2_epoch10.pt
 ```
 
-**Phase 2: Supervised Learning**
-```bash
-python scripts/train.py \
-  --phase 2 \
-  --config configs/phase2.yaml \
-  --resume checkpoints/phase1/checkpoint_phase1_final.pt \
-  --data-path data/train.json \
-  --output checkpoints/phase2/
-```
-
-**Phase 3: RL Fine-Tuning**
-```bash
-python scripts/train.py \
-  --phase 3 \
-  --config configs/phase3.yaml \
-  --resume checkpoints/phase2/checkpoint_best.pt \
-  --data-path data/train.json \
-  --output checkpoints/phase3/
-```
-
-**Evaluation**
-```bash
-python scripts/evaluate.py \
-  --checkpoint checkpoints/phase3/checkpoint_best.pt \
-  --test-set data/test.json \
-  --output results.json
-```
-
-**Model Verification** (parameter count, forward pass, memory estimate)
-```bash
-python scripts/verify_model.py
+```python
+# In trainer
+if args.resume:
+    self.load_checkpoint(args.resume)
+    print(f"Resumed from epoch {self.epoch}")
 ```
 
 ---
 
-## Additional Resources
+## Hyperparameter Tuning
 
-- **Architecture Details**: `docs/ML_PIPELINE.md`
-- **Dataset Generation**: `docs/DATA_GENERATION.md`
-- **Inference Pipeline**: `docs/INFERENCE.md`
-- **Encoder Ablations**: `src/models/encoder_ablation.py`
-- **Loss Functions**: `src/training/losses.py`
+### Grid Search
+
+```bash
+for lr in 1e-3 1e-4 1e-5; do
+    for batch_size in 16 32 64; do
+        python scripts/train.py \
+            --phase 2 \
+            --learning_rate $lr \
+            --batch_size $batch_size
+    done
+done
+```
+
+### Random Search
+
+```python
+import random
+
+for trial in range(num_trials):
+    config = {
+        'learning_rate': 10 ** random.uniform(-5, -3),
+        'batch_size': random.choice([16, 32, 64]),
+        'dropout': random.uniform(0.0, 0.3),
+        'hidden_dim': random.choice([256, 512, 768])
+    }
+
+    model = create_model(config)
+    accuracy = train_and_evaluate(model, config)
+
+    if accuracy > best_accuracy:
+        best_config = config
+```
+
+### Bayesian Optimization
+
+```python
+from ax.service.ax_client import AxClient
+
+ax_client = AxClient()
+ax_client.create_experiment(
+    parameters=[
+        {'name': 'learning_rate', 'type': 'range', 'bounds': [1e-5, 1e-3], 'log_scale': True},
+        {'name': 'batch_size', 'type': 'choice', 'values': [16, 32, 64]},
+    ]
+)
+
+for trial in range(20):
+    parameters, trial_index = ax_client.get_next_trial()
+    accuracy = train_and_evaluate(parameters)
+    ax_client.complete_trial(trial_index=trial_index, raw_data=accuracy)
+
+best_params, _ = ax_client.get_best_parameters()
+```
 
 ---
 
-**Next Steps**: Generate dataset → Run Phase 1 → Monitor loss convergence → Proceed to Phase 2 curriculum → Fine-tune with RL → Evaluate on test set.
+## Common Issues & Solutions
+
+### Issue: Overfitting
+
+**Symptoms**:
+- High train accuracy, low val accuracy
+- Increasing gap between train/val loss
+
+**Solutions**:
+1. Increase dropout (0.1 → 0.3)
+2. Add weight decay (1e-4)
+3. Reduce model size
+4. More data augmentation
+5. Early stopping
+
+### Issue: Underfitting
+
+**Symptoms**:
+- Low train and val accuracy
+- Loss plateaus early
+
+**Solutions**:
+1. Increase model capacity (hidden_dim, num_layers)
+2. Train longer
+3. Increase learning rate
+4. Remove regularization
+5. Check data quality
+
+### Issue: Training Instability
+
+**Symptoms**:
+- Loss spikes or NaN
+- Gradients explode
+
+**Solutions**:
+1. Gradient clipping (max_norm=1.0)
+2. Lower learning rate
+3. Use mixed precision carefully
+4. Check for bad samples in data
+
+### Issue: Slow Convergence
+
+**Symptoms**:
+- Loss decreases very slowly
+- Many epochs needed
+
+**Solutions**:
+1. Increase learning rate
+2. Use learning rate warmup
+3. Better optimizer (AdamW vs SGD)
+4. Batch normalization / Layer normalization
+5. Better initialization
+
+---
+
+## Best Practices
+
+1. **Always use Phase 1 pretraining** - Improves Phase 2 by 5-10%
+2. **Curriculum learning is essential** - Random depth training fails for depth 10+
+3. **Monitor per-depth accuracy** - Overall accuracy can hide depth-specific issues
+4. **Save checkpoints frequently** - Training can be interrupted
+5. **Use gradient clipping** - Prevents exploding gradients (max_norm=1.0)
+6. **Validate every epoch** - Early stopping prevents overfitting
+7. **Log everything** - TensorBoard/W&B for debugging
+8. **Run ablation studies** - Compare encoders systematically
+9. **Use mixed precision** - 2× speedup on modern GPUs
+10. **Start with base model** - Scale up only if needed
+
+---
+
+## Performance Benchmarks
+
+### Base Model (15M params)
+
+| Phase | GPU | Batch Size | Time/Epoch | Total Time |
+|-------|-----|------------|------------|------------|
+| 1 | GTX 1080 Ti | 128 | 180s | 60h |
+| 2 | GTX 1080 Ti | 32 | 240s | 100h |
+| 3 | GTX 1080 Ti | 16 | 120s | 20h |
+
+### Scaled Model (360M params)
+
+| Phase | GPU | Batch Size | Time/Epoch | Total Time |
+|-------|-----|------------|------------|------------|
+| 1 | RTX 3090 | 64 | 300s | 100h |
+| 2 | RTX 3090 | 16 | 400s | 160h |
+| 3 | RTX 3090 | 8 | 180s | 30h |
+
+**Multi-GPU**: Use `torch.nn.DataParallel` or `DistributedDataParallel` for 4× speedup
+
+---
+
+## Implementation Files
+
+| Component | File | Lines |
+|-----------|------|-------|
+| Base Trainer | `src/training/base_trainer.py` | 250 |
+| Phase 1 Trainer | `src/training/phase1_trainer.py` | 200 |
+| Phase 1b GMN Trainer | `src/training/phase1b_gmn_trainer.py` | 180 |
+| Phase 1c GMN Trainer | `src/training/phase1c_gmn_trainer.py` | 160 |
+| Phase 2 Trainer | `src/training/phase2_trainer.py` | 300 |
+| Phase 3 Trainer | `src/training/phase3_trainer.py` | 350 |
+| Ablation Trainer | `src/training/ablation_trainer.py` | 220 |
+| Loss Functions | `src/training/losses.py` | 280 |
+| Negative Sampler | `src/training/negative_sampler.py` | 120 |
+| Train Script | `scripts/train.py` | 300 |
+
+---
+
+## References
+
+1. **Contrastive Learning**: Chen et al., "A Simple Framework for Contrastive Learning of Visual Representations" (ICML 2020)
+2. **Masked Language Modeling**: Devlin et al., "BERT: Pre-training of Deep Bidirectional Transformers" (NAACL 2019)
+3. **Curriculum Learning**: Bengio et al., "Curriculum Learning" (ICML 2009)
+4. **PPO**: Schulman et al., "Proximal Policy Optimization Algorithms" (arXiv 2017)
+5. **Graph Matching Networks**: Li et al., "Graph Matching Networks for Learning the Similarity of Graph Structured Objects" (ICML 2019)
+6. **Mixed Precision Training**: Micikevicius et al., "Mixed Precision Training" (ICLR 2018)

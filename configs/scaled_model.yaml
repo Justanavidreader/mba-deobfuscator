@@ -87,8 +87,10 @@ data:
   max_depth: 14
   num_samples: 12000000  # 12M samples
 
-  # Dataset features
-  use_subexpr_sharing: true  # +3-5% accuracy, 3x fewer edges
+  # Dataset type: "scaled" for ScaledMBADataset (subexpression sharing)
+  dataset_type: scaled
+  share_subexpressions: true  # +3-5% accuracy, 3x fewer edges
+  max_seq_len: 2048  # Support very long sequences for depth-14
   use_precomputed_fingerprints: true  # From JSON Schema v6
 
 wandb:

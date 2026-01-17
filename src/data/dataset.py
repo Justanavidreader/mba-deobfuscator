@@ -24,7 +24,8 @@ from src.data.fingerprint import SemanticFingerprint
 from src.data.augmentation import VariableAugmentationMixin
 from src.constants import (
     EDGE_TYPES, VAR_AUGMENT_ENABLED, VAR_AUGMENT_PROB, USE_DAG_FEATURES,
-    FINGERPRINT_DIM,
+    FINGERPRINT_DIM, FINGERPRINT_DIM_FULL,
+    DERIVATIVE_START, DERIVATIVE_END,
 )
 from src.models.edge_types import EdgeType, NodeType, NODE_TYPE_MAP, LEGACY_SKIP_TYPES, convert_legacy_node_types
 
@@ -60,22 +61,64 @@ def _normalize_item(item: Dict) -> Dict:
     return normalized
 
 
-def _validate_precomputed_fingerprint(fp: List[float]) -> np.ndarray:
+def _strip_derivatives(fp: np.ndarray) -> np.ndarray:
     """
-    Validate pre-computed fingerprint dimension and numeric values.
+    Remove derivative component from fingerprint.
+
+    C++ and Python have different evaluation methods, causing derivative
+    mismatches. Strip derivatives to maintain consistency.
+
+    Fingerprint layout (448 dims):
+        0-31: Symbolic (32)
+        32-287: Corner (256)
+        288-351: Random (64)
+        352-383: Derivative (32) <- REMOVED
+        384-447: Truth table (64)
+
+    After stripping (416 dims):
+        0-31: Symbolic (32)
+        32-287: Corner (256)
+        288-351: Random (64)
+        352-415: Truth table (64)
 
     Args:
-        fp: Pre-computed fingerprint from C++ generator
+        fp: Full fingerprint (448 dims or 416 dims)
 
     Returns:
-        Validated fingerprint as numpy array
+        Fingerprint without derivatives (416 dims)
+    """
+    if len(fp) == FINGERPRINT_DIM:
+        # Already stripped
+        return fp
+    elif len(fp) == FINGERPRINT_DIM_FULL:
+        # Strip derivatives: concatenate [0:352] + [384:448]
+        return np.concatenate([
+            fp[:DERIVATIVE_START],      # Symbolic + Corner + Random (0-351)
+            fp[DERIVATIVE_END:]          # Truth table (384-447)
+        ])
+    else:
+        raise ValueError(
+            f"Invalid fingerprint dimension: {len(fp)}. "
+            f"Expected {FINGERPRINT_DIM} (stripped) or {FINGERPRINT_DIM_FULL} (full)"
+        )
+
+
+def _validate_precomputed_fingerprint(fp: List[float]) -> np.ndarray:
+    """
+    Validate and strip pre-computed fingerprint.
+
+    Args:
+        fp: Pre-computed fingerprint from C++ generator (448 dims with derivatives)
+
+    Returns:
+        Validated fingerprint without derivatives (416 dims)
 
     Raises:
         ValueError: If dimension mismatch or NaN/inf detected
     """
-    if len(fp) != FINGERPRINT_DIM:
+    if len(fp) != FINGERPRINT_DIM_FULL:
         raise ValueError(
-            f"Pre-computed fingerprint has {len(fp)} dims, expected {FINGERPRINT_DIM}"
+            f"Pre-computed fingerprint has {len(fp)} dims, expected {FINGERPRINT_DIM_FULL}"
         )
 
     fp_array = np.array(fp, dtype=np.float32)
@@ -84,7 +127,8 @@ def _validate_precomputed_fingerprint(fp: List[float]) -> np.ndarray:
             f"Pre-computed fingerprint contains NaN or inf values"
         )
 
-    return fp_array
+    # Strip derivatives before returning (448 -> 416 dims)
+    return _strip_derivatives(fp_array)
 
 
 class MBADataset(Dataset, VariableAugmentationMixin):
@@ -294,7 +338,8 @@ class MBADataset(Dataset, VariableAugmentationMixin):
             fp_tensor = torch.from_numpy(fp_array)
         else:
             fp = self.fingerprint.compute(obfuscated)
-            fp_tensor = torch.from_numpy(fp).float()
+            fp_stripped = _strip_derivatives(fp)
+            fp_tensor = torch.from_numpy(fp_stripped).float()
 
         # Tokenize target (simplified expression)
         target_ids = self.tokenizer.encode(simplified, add_special=True)
@@ -499,10 +544,12 @@ class ContrastiveDataset(Dataset, VariableAugmentationMixin):
             fp_array = _validate_precomputed_fingerprint(item['fingerprint']['flat'])
             obf_fp = torch.from_numpy(fp_array)
         else:
-            obf_fp = torch.from_numpy(self.fingerprint.compute(obfuscated)).float()
+            obf_fp_full = self.fingerprint.compute(obfuscated)
+            obf_fp = torch.from_numpy(_strip_derivatives(obf_fp_full)).float()
 
         # Simplified always computed (not pre-stored in C++ format)
-        simp_fp = torch.from_numpy(self.fingerprint.compute(simplified)).float()
+        simp_fp_full = self.fingerprint.compute(simplified)
+        simp_fp = torch.from_numpy(_strip_derivatives(simp_fp_full)).float()
 
         return {
             'obf_graph': obf_graph,
@@ -895,7 +942,8 @@ class ScaledMBADataset(Dataset, VariableAugmentationMixin):
             fp_tensor = torch.from_numpy(fp_array)
         elif self.fingerprint is not None:
             fp = self.fingerprint.compute(obfuscated)
-            fp_tensor = torch.from_numpy(fp).float()
+            fp_stripped = _strip_derivatives(fp)
+            fp_tensor = torch.from_numpy(fp_stripped).float()
         else:
             raise ValueError("No fingerprint available and no fingerprint computer provided")
 

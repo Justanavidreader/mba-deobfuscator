@@ -251,6 +251,9 @@ def ast_to_graph(
     collect_nodes(ast)
     num_nodes = len(nodes)
 
+    # Build parent map once for efficient depth computation
+    parent_map = _build_parent_map(nodes, node_to_idx)
+
     # Build node features [num_nodes, NODE_DIM]
     node_features = torch.zeros((num_nodes, NODE_DIM), dtype=torch.float32)
 
@@ -260,7 +263,7 @@ def ast_to_graph(
         node_features[idx, type_idx] = 1.0
 
         # Positional encoding (tree depth and position within parent)
-        depth = _get_depth(nodes, idx)
+        depth = _compute_depth_from_parent_map(idx, parent_map)
         node_features[idx, len(NODE_TYPES)] = depth / 20.0  # Normalize
 
         # For variables, encode which variable (x0-x7)
@@ -345,17 +348,49 @@ def ast_to_graph(
     return data
 
 
-def _get_depth(nodes: List[ASTNode], idx: int) -> int:
-    """Calculate depth of node in tree (root = 0)."""
-    # Simple implementation: traverse from root counting depth
-    # For efficiency, could cache during collection
-    depth = 0
-    visited = {idx}
+def _build_parent_map(nodes: List[ASTNode], node_to_idx: Dict[int, int]) -> Dict[int, int]:
+    """
+    Build mapping from child index to parent index.
 
-    # Find path to root by following parent edges
-    # For now, return estimated depth based on node position
-    # This is approximate but sufficient for positional encoding
-    return min(idx, 15)
+    Args:
+        nodes: List of all nodes in DFS order
+        node_to_idx: Mapping from id(node) to node index
+
+    Returns:
+        Dict mapping child_idx -> parent_idx
+    """
+    parent_map = {}
+    for parent_idx, node in enumerate(nodes):
+        for child in node.children:
+            child_idx = node_to_idx.get(id(child))
+            if child_idx is not None:
+                parent_map[child_idx] = parent_idx
+    return parent_map
+
+
+def _compute_depth_from_parent_map(idx: int, parent_map: Dict[int, int]) -> int:
+    """
+    Compute depth of node from parent map.
+
+    Args:
+        idx: Index of node
+        parent_map: Mapping from child_idx to parent_idx
+
+    Returns:
+        Depth of node (root = 0)
+    """
+    if idx == 0:
+        return 0  # Root node
+
+    depth = 0
+    current = idx
+    while current in parent_map:
+        depth += 1
+        current = parent_map[current]
+        if depth > 50:  # Sanity check for cycles
+            break
+
+    return depth
 
 
 def expr_to_graph(
