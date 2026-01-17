@@ -1,17 +1,17 @@
-# Scaled MBA Deobfuscator Configuration (~360M parameters)
+# Scaled MBA Deobfuscator Configuration (~420M parameters)
 # Chinchilla-optimal for 12M samples (7.2B tokens)
 #
 # Parameter breakdown:
-#   Encoder (HGT/RGCN): ~60M params
+#   Encoder (HGT 24 layers): ~120M params
 #   Decoder (Transformer): ~302M params (8 layers x ~37.7M/layer)
-#   Total: ~362M params
+#   Total: ~422M params
 
 model:
   encoder_type: "hgt"  # Options: "hgt" (default), "rgcn"
 
-  # Encoder (HGT/RGCN) - ~60M params
+  # Encoder (HGT/RGCN) - ~120M params (24 layers)
   hidden_dim: 768
-  num_encoder_layers: 12
+  num_encoder_layers: 24
   num_encoder_heads: 16
   encoder_dropout: 0.1
   num_node_types: 10  # ADD,SUB,MUL,NEG,AND,OR,XOR,NOT,VAR,CONST
@@ -21,7 +21,7 @@ model:
   edge_type_mode: optimized
 
   # Advanced encoder features
-  use_global_attention: false  # GraphGPS-style hybrid (global + local attention)
+  use_global_attention: true  # GraphGPS-style hybrid (global + local attention) - ENABLED
   global_attn_interval: 2      # Insert global attention every N layers
   global_attn_heads: 16        # Attention heads for global blocks
 

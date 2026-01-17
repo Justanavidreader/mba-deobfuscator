@@ -4,13 +4,13 @@
 model:
   encoder_type: semantic_hgt
   hidden_dim: 768
-  num_encoder_layers: 12
+  num_encoder_layers: 24
   num_encoder_heads: 16
   encoder_dropout: 0.1
 
   # Semantic HGT specific
   enable_property_detection: true
-  property_injection_layer: 8  # Inject after layer 8 of 12
+  property_injection_layer: 16  # Inject after layer 16 of 24 (67% depth)
 
   # Decoder (same as scaled model)
   d_model: 1536

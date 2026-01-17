@@ -2,7 +2,7 @@
 
 > **Mission**: Simplify obfuscated Mixed Boolean-Arithmetic expressions using GNN+Transformer architecture with formal verification.
 
-**Status**: Production-ready codebase (85-90% complete) | **Parameters**: 15M (base) / 360M (scaled)
+**Status**: Production-ready codebase (85-90% complete) | **Parameters**: 15M (base) / 420M (scaled)
 
 ---
 
@@ -155,8 +155,8 @@ from src.models.encoder_registry import get_encoder
 # Base model (15M total params)
 encoder = get_encoder('gat_jknet', hidden_dim=256, num_layers=4)
 
-# Scaled model (360M total params)
-encoder = get_encoder('hgt', hidden_dim=768, num_layers=12)
+# Scaled model (420M total params, 24 layers with global attention)
+encoder = get_encoder('hgt', hidden_dim=768, num_layers=24)
 ```
 
 ---
@@ -218,16 +218,45 @@ python scripts/train.py --phase 3 --config configs/phase3.yaml
 
 ## Semantic Fingerprint (416-dim for ML)
 
-**Raw fingerprint**: 448 dimensions
-**ML fingerprint**: 416 dimensions (derivatives excluded due to C++/Python evaluation differences)
+**Raw fingerprint**: 448 dimensions (from C++ or Python computation)
+**ML fingerprint**: 416 dimensions (**derivatives excluded** - see critical note below)
 
-| Component | Dims | Method | Values |
-|-----------|------|--------|--------|
-| Symbolic | 32 | Structural analysis | Node degrees, op counts, depth, variables |
-| Corner | 256 | 4 widths × 64 cases | Extreme value evaluation (0, 1, -1, max, min) |
-| Random | 64 | 4 widths × 16 inputs | Deterministic hash inputs |
-| ~~Derivative~~ | ~~32~~ | ~~4 widths × 8 orders~~ | **EXCLUDED** (C++/Python mismatch) |
-| Truth Table | 64 | 2^6 for 6 vars | Boolean function evaluation |
+| Component | Dims | Indices | Method | Values |
+|-----------|------|---------|--------|--------|
+| Symbolic | 32 | 0-31 | Structural analysis | Node degrees, op counts, depth, variables |
+| Corner | 256 | 32-287 | 4 widths × 64 cases | Extreme value evaluation (0, 1, -1, max, min) |
+| Random | 64 | 288-351 | 4 widths × 16 inputs | Deterministic hash inputs |
+| ~~Derivative~~ | ~~32~~ | ~~352-383~~ | ~~4 widths × 8 orders~~ | **EXCLUDED FROM ML** (C++/Python mismatch) |
+| Truth Table | 64 | 384-447 | 2^6 for 6 vars | Boolean function evaluation |
+
+### Critical: Derivative Exclusion in ML Workflow
+
+**Derivatives (indices 352-383) are EXCLUDED from the entire ML pipeline.**
+
+**Reason**: C++ and Python evaluation methods produce different results for finite difference derivative approximations, causing training instabilities.
+
+**Impact**:
+- Datasets use 416-dim fingerprints (derivatives stripped via `_strip_derivatives()`)
+- Property detection uses indices: 0-31, 32-287, 288-351, 384-447 (skips 352-383)
+- All ML models expect 416-dim input (not 448-dim)
+
+**Implementation**:
+```python
+# In dataset loading (src/data/dataset.py)
+def _strip_derivatives(self, fingerprint):
+    """Strip derivative features (indices 352-383)."""
+    return np.concatenate([
+        fingerprint[:352],   # Symbolic + Corner + Random
+        fingerprint[384:]    # Truth Table
+    ])  # Result: 416 dims (352 + 64)
+
+# In property detection (src/training/property_labels_fingerprint.py)
+symbolic = fingerprint[:, 0:32]           # Indices 0-31
+corner = fingerprint[:, 32:288]           # Indices 32-287
+random_hash = fingerprint[:, 288:352]     # Indices 288-351
+# SKIP: fingerprint[:, 352:384]          # Derivatives (EXCLUDED)
+truth_table = fingerprint[:, 384:448]     # Indices 384-447
+```
 
 **Bit widths**: 8, 16, 32, 64 (deterministic evaluation at all widths)
 
@@ -239,6 +268,7 @@ from src.data.fingerprint import SemanticFingerprint
 fp = SemanticFingerprint()
 vector = fp.compute(expression)  # Returns 448-dim ndarray
 ml_vector = vector[:352] + vector[384:]  # Strip derivatives → 416-dim
+# Or use dataset's _strip_derivatives() method for consistency
 ```
 
 ---
@@ -415,7 +445,7 @@ configs/
 ├── phase3.yaml                   # RL fine-tuning
 ├── phase1b_gmn.yaml              # GMN training (frozen encoder)
 ├── phase1c_gmn_finetune.yaml     # GMN end-to-end fine-tuning
-├── scaled_model.yaml             # 360M parameter model
+├── scaled_model.yaml             # 420M parameter model (24 layers)
 ├── semantic_hgt.yaml             # Semantic HGT specific config
 └── example.yaml                  # Reference configuration
 ```
@@ -473,8 +503,8 @@ pytest tests/ --cov=src --cov-report=html
 ### Scalability
 
 - **Base model (15M)**: ~60MB weights, 1 GPU sufficient
-- **Scaled model (360M)**: ~1.4GB weights, 1-4 GPUs recommended
-- **Training time**: Phase 1 (40-60h) + Phase 2 (80-120h) + Phase 3 (20-30h) on single GPU
+- **Scaled model (420M)**: ~1.7GB weights, 1-4 GPUs recommended (A100 40GB minimum)
+- **Training time**: Phase 1 (40-60h) + Phase 2 (100-140h) + Phase 3 (20-30h) on single GPU
 
 ---
 
@@ -546,11 +576,11 @@ model = MBADeobfuscator(
     decoder_heads=8
 )
 
-# Scaled model
+# Scaled model (420M params, 24 layers with global attention)
 model = MBADeobfuscator(
     encoder_type='hgt',
     hidden_dim=768,
-    num_layers=12,
+    num_layers=24,
     decoder_layers=8,
     decoder_heads=24,
     decoder_dim=1536

@@ -22,7 +22,9 @@ from src.utils.metrics import (
     avg_simplification_ratio,
     syntax_accuracy
 )
-from src.utils.verification_utils import safe_verify, check_syntax
+# Note: verification_utils imports from src.inference.verify, which creates
+# a circular dependency. Import directly when needed instead.
+# from src.utils.verification_utils import safe_verify, check_syntax
 
 __all__ = [
     'Config',
@@ -42,6 +44,6 @@ __all__ = [
     'syntax_valid',
     'avg_simplification_ratio',
     'syntax_accuracy',
-    'safe_verify',
-    'check_syntax',
+    # 'safe_verify',  # Import from verification_utils directly
+    # 'check_syntax',  # Import from verification_utils directly
 ]

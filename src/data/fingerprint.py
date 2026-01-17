@@ -243,14 +243,22 @@ class SemanticFingerprint:
         Extract structural features from expression.
 
         Features (32 dims):
-        - Expression length (normalized)
-        - Number of each operator type (7 types)
-        - Number of variables
-        - Number of constants
-        - Parenthesis depth
-        - Total depth estimate
-        - Variable usage counts (8 dims for x0-x7)
-        - Constant value statistics (mean, std, min, max)
+        [0]     Expression length (normalized by 200)
+        [1-7]   Operator counts (normalized by 10):
+                  [1] '+' (ADD)
+                  [2] '-' (SUB)
+                  [3] '*' (MUL)
+                  [4] '&' (AND)
+                  [5] '|' (OR)
+                  [6] '^' (XOR)
+                  [7] '~' (NOT)
+        [8]     Number of variables (normalized by 8)
+        [9]     Number of constants (normalized by 10)
+        [10]    Parenthesis depth (normalized)
+        [11]    Total depth estimate (normalized)
+        [12-19] Variable usage counts for x0-x7 (normalized by 5)
+        [20-23] Constant value statistics (mean, std, min, max, normalized)
+        [24-31] Reserved/padding
         """
         features = np.zeros(SYMBOLIC_DIM, dtype=np.float64)
         idx = 0

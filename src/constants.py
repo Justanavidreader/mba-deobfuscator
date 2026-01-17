@@ -297,7 +297,7 @@ NUM_NODE_TYPES_HETEROGENEOUS: int = 10  # ADD,SUB,MUL,NEG,AND,OR,XOR,NOT,VAR,CON
 # Optional global self-attention interleaved with HGT local message passing.
 # Enables O(1) detection of repeated subexpressions instead of O(depth) propagation.
 
-HGT_USE_GLOBAL_ATTENTION: bool = False  # Default off for backward compatibility
+HGT_USE_GLOBAL_ATTENTION: bool = True  # GraphGPS-style hybrid architecture enabled
 HGT_GLOBAL_ATTN_INTERVAL: int = 2       # Insert global attention every N HGT layers
 HGT_GLOBAL_ATTN_HEADS: int = 8          # Attention heads for global attention
 HGT_GLOBAL_ATTN_FFN_RATIO: float = 4.0  # FFN hidden dim multiplier
